@@ -599,7 +599,7 @@ class LiveDashboard:
         """One line that always fits the terminal.
 
         A line wider than the window wraps, and then `\\r` only returns to the
-        start of the last visual row while `\\033[2K` clears only that row — so
+        start of the last visual row while `\\033[2K` clears only that row, so
         every redraw leaves its remainder behind and scrolls the terminal away.
         The request counts are what the line is for, so they are never dropped;
         everything else is added only while there is room.
@@ -1154,7 +1154,7 @@ def _resolve_front_end() -> str:
     if _find_app():
         return "app"
     if _which("codex"):
-        print("ChatGPT/Codex.app was not found — launching the Codex CLI instead.\n")
+        print("ChatGPT/Codex.app was not found. Launching the Codex CLI instead.\n")
         return "cli"
     raise SystemExit(
         "Codex Local found neither the ChatGPT desktop app nor the `codex` CLI.\n\n"
@@ -1187,7 +1187,7 @@ def _no_models_message(models_config_path: Path) -> str:
         f"  Custom    {models_config_path}   "
         f"{'found' if models_config_path.is_file() else 'not found'}",
         "",
-        "Only private endpoints are offered — loopback, private LAN, link-local",
+        "Only private endpoints are offered: loopback, private LAN, link-local",
         "or .local hosts. A configured model served from a public URL is",
         "deliberately skipped, because sending Codex's conversation there would",
         "not be local inference.",
@@ -1911,7 +1911,7 @@ def _prepare_config_file(path: Path) -> None:
     """Secure an existing configuration file, or import one if asked to.
 
     Codex Local never creates this file. Models are discovered from the tools that
-    already own that information — Pi, OpenCode, and a local oMLX install — so
+    already own that information (Pi, OpenCode, and a local oMLX install), so
     a working setup needs no Codex Local configuration at all. The file exists only
     for people who want to pin a slot or add an endpoint none of those know
     about, and writing an empty one on first run would just be litter.
@@ -1963,8 +1963,8 @@ CONFIG_TEMPLATE: dict[str, Any] = {
 def _config_command(models_path: Path, *, initialise: bool) -> int:
     """Show the configuration, or write a starting one on request.
 
-    Codex Local never writes this file on its own — models come from Pi, OpenCode
-    and oMLX — so creating it is always something the user asked for.
+    Codex Local never writes this file on its own: models come from Pi,
+    OpenCode and oMLX, so creating it is always something the user asked for.
     """
     if initialise:
         if models_path.is_file():
@@ -2103,7 +2103,7 @@ def _print_preflight(
         # The real slot names come from Codex's own catalogue, which Codex Local
         # only sees once Codex has fetched it through the proxy.
         print(
-            "       (slot confirmed once Codex connects — Codex Local claims the "
+            "       (slot confirmed once Codex connects; Codex Local claims the "
             "lowest-ranked visible model)"
         )
     print(f"Project  {Path(project).expanduser().resolve()}")
@@ -2342,7 +2342,7 @@ def _doctor_next_steps(payload: dict[str, Any]) -> list[str]:
         )
     if not payload["codex_cli"] and not payload["codex_app"]:
         steps.append(
-            "Install the Codex CLI or the ChatGPT desktop app — Codex Local needs "
+            "Install the Codex CLI or the ChatGPT desktop app. Codex Local needs "
             "one of them to launch."
         )
     if not payload["models_available"]:

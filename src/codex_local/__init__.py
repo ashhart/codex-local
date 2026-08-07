@@ -1,4 +1,4 @@
-"""Codex Local — run Codex on your own local model.
+"""Codex Local: run Codex on your own local model.
 
 Codex Local starts the Codex app or CLI behind a process-scoped HTTPS proxy that
 recognises exactly one model slot. Requests for that slot are served by a

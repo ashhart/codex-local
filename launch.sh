@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Codex Local — one command to run Codex on your own local model.
+# Codex Local: one command to run Codex on your own local model.
 #
 # This is the checkout-first start script. It needs nothing installed:
 # it runs Codex Local straight from this repository, checks that the two
@@ -119,7 +119,7 @@ case "$command" in
         exec "$PYTHON" -m codex_local --help
         ;;
     *)
-        # Unknown first word — show the real error from the launcher.
+        # Unknown first word, so show the real error from the launcher.
         exec "$PYTHON" -m codex_local "$@"
         ;;
 esac

@@ -732,7 +732,7 @@ def append_explicit_plugin_skill_instructions(
                     {
                         "type": "input_text",
                         "text": (
-                            f"INSTALLED `{plugin}` PLUGIN SKILL INSTRUCTIONS — "
+                            f"INSTALLED `{plugin}` PLUGIN SKILL INSTRUCTIONS: "
                             "these are authoritative and must be followed exactly. "
                             "Do not improvise a different runtime or automation method.\n\n"
                             + body
@@ -887,7 +887,7 @@ def transform_compaction_request(
         {
             "role": "user",
             "content": (
-                f"{COMPACTION_TASK_MARKER} — do not continue, solve, or answer the conversation. "
+                f"{COMPACTION_TASK_MARKER}: do not continue, solve, or answer the conversation. "
                 "Produce a lossless handoff for a new model instance. Never infer that work "
                 "is complete: pending work remains pending unless the history explicitly "
                 "records its successful completion. Return only these sections:\n"
@@ -2377,7 +2377,7 @@ def _recovered_history_message(label: str, value: Any) -> dict[str, Any]:
         "content": [
             {
                 "type": "input_text",
-                "text": f"RECOVERED HISTORY — {label}: {text}",
+                "text": f"RECOVERED HISTORY ({label}): {text}",
             }
         ],
     }
