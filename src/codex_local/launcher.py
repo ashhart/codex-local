@@ -1206,7 +1206,7 @@ def _interactive(
     verbose: bool = False,
 ) -> int:
     project_dir = project_dir or str(Path.cwd())
-    print("\nCodex Local — run Codex on your own model")
+    print("\nCodex Local: run Codex on your own model")
     print(
         "Codex keeps its configuration, Projects, plugins, automations and "
         "account. Only the chosen model slot is served locally.\n"

@@ -1,11 +1,12 @@
 # Codex Local
 
-**Run Codex on your own local model — without giving up everything else Codex does.**
+**Run Codex on your own local model, without giving up everything else Codex does.**
 
 Codex Local starts Codex behind a small proxy that recognises exactly one model
 slot. Requests for that slot are answered by a model on your own hardware.
-Every other request — the ones carrying Projects, plugins, automations, your
-account, your history — goes to its normal destination, untouched.
+Every other request, including the ones carrying Projects, plugins,
+automations, your account and your history, goes to its normal destination
+untouched.
 
 Codex configuration is never edited. Not one line.
 
@@ -23,7 +24,7 @@ one, and opens Codex.
 This is the part worth understanding, because it is the reason Codex Local exists.
 
 The usual way to point Codex at a local model is to add a custom provider to
-`~/.codex/config.toml`. It works — the model responds — but you are changing
+`~/.codex/config.toml`. It works, and the model responds, but you are changing
 *who Codex is talking to*. Codex is no longer a client of your ChatGPT account;
 it is a client of `http://localhost:9000`. And the features that exist because
 of that account relationship go with it: Projects, automations, plugins,
@@ -50,12 +51,12 @@ were:
 
 The left column is what follows from Codex no longer being a client of your
 ChatGPT account: those features exist because of that relationship, and they go
-when it does. The right column is not a promise — it is what Codex Local's own
+when it does. The right column is not a promise: it is what Codex Local's own
 end-of-session checklist asks you to confirm, every session, before it will
 call a run complete.
 
-Pair it with a capable local model — DeepSeek, GLM, Qwen, whatever your machine
-runs well — and you get local inference without the amputation.
+Pair it with a capable local model (DeepSeek, GLM, Qwen, whatever your machine
+runs well) and you get local inference without the amputation.
 
 > **Verify it yourself, don't take my word for it.** Take the SHA-256 of
 > `~/.codex/config.toml` before and after a session; it is unchanged. Codex's
@@ -67,8 +68,8 @@ runs well — and you get local inference without the amputation.
 ## What you need
 
 - **macOS or Linux**, with Python 3.10+
-- **mitmproxy** — `./launch.sh` offers to install it if it is missing
-- **Codex** — the ChatGPT desktop app, or the `codex` CLI
+- **mitmproxy**: `./launch.sh` offers to install it if it is missing
+- **Codex**: the ChatGPT desktop app, or the `codex` CLI
 - **A local model** served over an OpenAI-compatible API
 
 Codex Local itself has no Python dependencies. mitmproxy runs as its own binary,
@@ -102,7 +103,7 @@ repository's `src/` on the path, and hands off to the launcher. No venv, no
 ./launch.sh cli --server NAME --model ID --project /path
 ```
 
-Start with `./launch.sh doctor` — it reports what it found and, if something is
+Start with `./launch.sh doctor`. It reports what it found and, if something is
 missing, exactly what to do about it.
 
 ### If you would rather install it
@@ -118,11 +119,11 @@ so the two are interchangeable.
 ## Finding your models
 
 **There is no configuration file to write.** Codex Local reads the tools that
-already hold your models — **Pi**, **OpenCode**, and a local **oMLX** install —
+already hold your models (**Pi**, **OpenCode**, and a local **oMLX** install)
 straight from their own config, and shows you what they have:
 
 ```
-Codex Local — run Codex on your own model
+Codex Local: run Codex on your own model
 
 Choose a model source
 › Pi          · 4 devices
@@ -168,7 +169,7 @@ codex-local config --init   # write a starting file
 ```
 
 Anything under `servers` shows up in the selector as **Custom**, grouped by
-name exactly like a Pi or OpenCode device — so you can use Codex Local with no
+name exactly like a Pi or OpenCode device, so you can use Codex Local with no
 Pi and no OpenCode at all, just your own endpoint and credentials. Omitted
 `sources` stay on, and `codex-local config --init` writes a fully annotated
 starting file if you would rather edit than type.
@@ -179,13 +180,13 @@ mode `0600` because it holds endpoint credentials.
 
 **Only private endpoints are offered.** Loopback, private LAN ranges,
 link-local, and `.local` hosts. A model configured behind a public URL is
-deliberately skipped — sending your conversation there would not be local
-inference, and Codex Local will not do it quietly.
+deliberately skipped, because sending your conversation there would not be
+local inference, and Codex Local will not do it quietly.
 
 ## Which slot does it claim?
 
 Codex ships several model slots. Codex Local claims the lowest-ranked one visible
-in your build — the one you are least likely to want for hosted work — and
+in your build (the one you are least likely to want for hosted work) and
 relabels it, so you see something like `Local · Workstation · qwen3.6-27b` in
 the model picker.
 
@@ -202,7 +203,7 @@ A local model is not a hosted model with a different URL, and most of Codex Loca
 is the difference between those two things:
 
 - **Compaction stays local.** A hosted compaction returns its summary as
-  ciphertext only the hosted backend can decrypt — a local model reading it
+  ciphertext only the hosted backend can decrypt. A local model reading it
   sees noise where the conversation summary should be, which is
   indistinguishable from having lost the thread.
 - **The tool array is kept on compaction turns**, with `tool_choice: none`
@@ -258,7 +259,7 @@ Useful flags: `--live` for the request dashboard, `--verbose` for
 privacy-safe routing events, `--idle-unload-seconds` to free VRAM after an idle
 period, `--warm-model` to warm a second model on the same server.
 
-## Limits — stated plainly
+## Limits, stated plainly
 
 - **macOS is the verified platform.** The desktop app path, the menu-bar
   status item, and process handling are all developed and tested there. The
@@ -270,7 +271,7 @@ period, `--warm-model` to warm a second model on the same server.
 - **This is unofficial.** Codex Local is not affiliated with OpenAI. It works
   by recognising Codex's current request paths, and a Codex update could change
   them. Nothing it does is hidden from you: the routing rules are the top of
-  `src/codex_local/routing.py` — the hosts, the exact paths, and the single
+  `src/codex_local/routing.py`: the hosts, the exact paths, and the single
   condition under which a request is touched at all.
 - **`workspace-write` style trust applies.** Your local model is answering as
   Codex's model, and Codex will act on what it says. Point it at models you
@@ -278,4 +279,4 @@ period, `--warm-model` to warm a second model on the same server.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
