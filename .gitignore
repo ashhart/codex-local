@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Leftovers from patch/restore workflows.
+*.orig
+*.rej
+
+# Local model configuration carries endpoint credentials. Codex Local stores it
+# in the user config directory at mode 0600; if anyone drops a copy here it must
+# never be committed.
+config.json
+models.json
+
+.DS_Store
