@@ -115,6 +115,15 @@ SAFE_EVENT_FIELDS = frozenset(
         "advertised_tool_names",
         "advertised_tool_types",
         "request_bytes",
+        # Structural facts about a request the local server rejected. Key
+        # names and shape only; the opening bytes of a Responses object are
+        # `{"model":"...` and cannot reach prompt text.
+        "request_keys",
+        "body_is_utf8",
+        "body_is_json",
+        "body_json_error",
+        "body_opens_with",
+        "body_decode_error_at",
         "input_item_count",
         "input_roles",
         "input_type_counts",
@@ -1802,6 +1811,44 @@ def summarize_responses_request(payload: dict[str, Any], raw_bytes: int) -> dict
     if isinstance(payload.get("store"), bool):
         summary["store"] = payload["store"]
     return summary
+
+
+def describe_rejected_request(body: bytes, payload: Any) -> dict[str, Any]:
+    """Structural facts about a request the local server refused.
+
+    When a server rejects a request, its complaint describes the bytes it
+    received, and without knowing what was actually sent that is impossible to
+    act on. This records shape only: the top-level key names, the item count,
+    the byte length, and whether the body is well-formed UTF-8 and JSON. Key
+    names are structure rather than content, so no prompt text is captured.
+    """
+    detail: dict[str, Any] = {"request_bytes": len(body)}
+    if isinstance(payload, dict):
+        detail["request_keys"] = sorted(str(key) for key in payload)
+        detail["input_item_count"] = _input_item_count(payload.get("input"))
+        tools = payload.get("tools")
+        detail["tool_count"] = len(tools) if isinstance(tools, list) else 0
+
+    # A body that is not valid UTF-8 or not valid JSON is our bug, not the
+    # server's, and the two are indistinguishable from the server's reply.
+    try:
+        text = body.decode("utf-8")
+        detail["body_is_utf8"] = True
+    except UnicodeDecodeError as exc:
+        detail["body_is_utf8"] = False
+        detail["body_decode_error_at"] = exc.start
+        return detail
+    try:
+        json.loads(text)
+        detail["body_is_json"] = True
+    except ValueError as exc:
+        detail["body_is_json"] = False
+        detail["body_json_error"] = str(exc)[:200]
+    # The opening bytes of a Responses request are structural (`{"model":"...`).
+    # Enough to tell one document shape from another, too short to carry a
+    # prompt, which never appears this early in the object.
+    detail["body_opens_with"] = text[:24]
+    return detail
 
 
 def is_compaction_request(payload: dict[str, Any]) -> bool:

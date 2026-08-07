@@ -102,6 +102,7 @@ from codex_local.routing import (  # noqa: E402
     sanitize_local_response_items,
     select_lowest_visible_codex_model,
     should_route_responses_locally,
+    describe_rejected_request,
     summarize_responses_request,
     synthetic_compaction_response,
     transform_compaction_request,
@@ -1803,6 +1804,7 @@ class CodexLocalInterceptor:
                 duration_ms=round((time.monotonic() - started) * 1000),
                 error=type(exc).__name__,
                 error_detail=_safe_preview(str(exc)),
+                **getattr(exc, "request_detail", {}),
                 local_failure_count=(
                     self._record_local_failure(request_digest)
                     if request_digest
@@ -1938,6 +1940,11 @@ class CodexLocalInterceptor:
                                 response.status,
                                 message
                                 or f"local upstream returned HTTP {response.status}",
+                            )
+                            # What the server complained about is only useful
+                            # next to what we actually sent it.
+                            wrapped.request_detail = describe_rejected_request(
+                                body, payload
                             )
                             loop.call_soon_threadsafe(
                                 queue.put_nowait, ("error", wrapped)
