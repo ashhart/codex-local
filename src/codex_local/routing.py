@@ -2381,7 +2381,7 @@ def repair_local_request(payload: Any) -> tuple[Any, list[str]]:
             continue
         item_type = item.get("type")
         call_id = item.get("call_id")
-        repaired_items.append(copy.deepcopy(item))
+        repaired_items.append(_repair_tool_call_arguments(item))
         if (
             item_type in {"function_call", "custom_tool_call"}
             and isinstance(call_id, str)
@@ -2408,6 +2408,38 @@ def repair_local_request(payload: Any) -> tuple[Any, list[str]]:
     repaired["input"] = repaired_items
     remaining = validate_local_request(repaired)
     return repaired, [rule for rule in original_rules if rule not in remaining]
+
+
+def _tool_call_arguments_are_json(item: dict[str, Any]) -> bool:
+    """Whether a tool call's arguments will survive the server's own parse."""
+    arguments = item.get("arguments")
+    if not isinstance(arguments, str) or not arguments.strip():
+        # Absent or empty arguments are handled by the server's own defaults.
+        return True
+    try:
+        json.loads(arguments)
+    except ValueError:
+        return False
+    return True
+
+
+def _repair_tool_call_arguments(item: dict[str, Any]) -> dict[str, Any]:
+    """Replace unparseable tool-call arguments with an empty object.
+
+    Truncated arguments cannot be reconstructed: the tokens the model never
+    emitted are gone. An empty object keeps the call, its identity and its
+    paired result intact, which is what the conversation needs to stay
+    coherent, and is accepted where the truncated string is rejected outright.
+    """
+    copied = copy.deepcopy(item)
+    if not isinstance(copied, dict):
+        return copied
+    if copied.get("type") not in {"function_call", "custom_tool_call"}:
+        return copied
+    if _tool_call_arguments_are_json(copied):
+        return copied
+    copied["arguments"] = "{}"
+    return copied
 
 
 def _tool_output_value(item: dict[str, Any]) -> Any:
@@ -2461,6 +2493,12 @@ def validate_local_request(payload: Any) -> list[str]:
             call_id = item.get("call_id")
             if isinstance(call_id, str):
                 pending_call_ids.add(call_id)
+            # `arguments` is JSON encoded inside the JSON body, so the server
+            # parses it separately and rejects the whole request when it is
+            # malformed. A model cut off mid-call leaves exactly that, and the
+            # item then sits in history poisoning every later turn.
+            if not _tool_call_arguments_are_json(item):
+                broken.append("function_call_arguments_not_json")
             seen_conversation = True
             continue
         if item_type in {"function_call_output", "tool_call_output", "custom_tool_call_output"}:
