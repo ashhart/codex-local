@@ -310,7 +310,17 @@ class PersistentUpstreamPool:
                 "connect_ms": connect_ms,
             }
         finally:
-            if response.isclosed() and not response.will_close:
+            # An error response is exactly when this connection's framing is
+            # suspect, so it never goes back in the pool. Returning it after a
+            # 4xx once poisoned the pool for the rest of the session: the next
+            # turn reused a desynchronised socket, the server read a fragment
+            # of the body as a fresh request, and rejected that too.
+            reusable = (
+                200 <= response.status < 300
+                and response.isclosed()
+                and not response.will_close
+            )
+            if reusable:
                 self._release(connection)
             else:
                 self._discard(connection)
@@ -1893,9 +1903,18 @@ class CodexLocalInterceptor:
                         if not 200 <= response.status < 300:
                             raw = response.read()
                             message = _upstream_error_message(raw)
-                            if (
-                                attempt < LOCAL_TRANSIENT_RETRY_ATTEMPTS
-                                and _is_transient_upstream_status(response.status)
+                            # A failure on a reused connection is retried once
+                            # on a fresh one. A request the server genuinely
+                            # dislikes fails identically either way, so this
+                            # costs one round trip; but a desynchronised pooled
+                            # socket only fails on the reused one, and that is
+                            # otherwise indistinguishable from a bad request.
+                            reused_connection = bool(
+                                connection_metrics.get("connection_reused")
+                            )
+                            if attempt < LOCAL_TRANSIENT_RETRY_ATTEMPTS and (
+                                _is_transient_upstream_status(response.status)
+                                or reused_connection
                             ):
                                 loop.call_soon_threadsafe(
                                     queue.put_nowait,
@@ -1903,7 +1922,13 @@ class CodexLocalInterceptor:
                                         "retry",
                                         {
                                             "retry_attempt": attempt + 1,
-                                            "retry_reason": "transient_http_status",
+                                            "retry_reason": (
+                                                "transient_http_status"
+                                                if _is_transient_upstream_status(
+                                                    response.status
+                                                )
+                                                else "reused_connection_rejected"
+                                            ),
                                             "retry_status": response.status,
                                         },
                                     ),
