@@ -42,13 +42,60 @@ fi
 # --- 2. mitmproxy present ----------------------------------------------------
 # The launcher also checks this with a friendly message, but we do it up front
 # so doctor-style commands give you one clear line instead of a menu prompt.
+#
+# We offer to install it, but never do so without being asked: Codex Local
+# generates a private CA and proxies your traffic, and a tool that does that
+# has no business installing system packages behind your back. Set
+# CODEX_LOCAL_ASSUME_YES=1 to skip the prompt in a script.
 if ! command -v mitmdump >/dev/null 2>&1; then
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        die "mitmdump was not found on PATH.
-       Install it once: brew install mitmproxy"
+    installer=()
+    if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
+        installer=(brew install mitmproxy)
+    elif command -v pipx >/dev/null 2>&1; then
+        installer=(pipx install mitmproxy)
+    elif command -v uv >/dev/null 2>&1; then
+        installer=(uv tool install mitmproxy)
+    fi
+
+    if (( ${#installer[@]} == 0 )); then
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            die "mitmdump was not found, and neither was Homebrew.
+       Install Homebrew from https://brew.sh, then: brew install mitmproxy"
+        else
+            die "mitmdump was not found, and neither was pipx or uv.
+       Install one of them, then: pipx install mitmproxy"
+        fi
+    fi
+
+    reply=n
+    if [[ "${CODEX_LOCAL_ASSUME_YES:-0}" == "1" ]]; then
+        reply=y
+    elif [[ -t 0 ]]; then
+        printf 'Codex Local needs mitmproxy, which is not installed.\n'
+        printf '  It will run: %s\n' "${installer[*]}"
+        printf 'Install it now? [y/N] '
+        read -r reply || reply=n
     else
+        # Non-interactive: never install unasked, just say what to run.
         die "mitmdump was not found on PATH.
-       Install it once: pipx install mitmproxy"
+       Install it once: ${installer[*]}"
+    fi
+
+    case "$reply" in
+        y | Y | yes | YES)
+            printf 'Installing mitmproxy with: %s\n' "${installer[*]}"
+            if ! "${installer[@]}"; then
+                die "'${installer[*]}' failed. Install mitmproxy manually and re-run."
+            fi
+            ;;
+        *)
+            die "mitmproxy is required. Install it with: ${installer[*]}"
+            ;;
+    esac
+
+    if ! command -v mitmdump >/dev/null 2>&1; then
+        die "mitmproxy installed, but 'mitmdump' is still not on PATH.
+       Open a new shell and re-run, or check your PATH."
     fi
 fi
 

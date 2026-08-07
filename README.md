@@ -67,11 +67,18 @@ runs well — and you get local inference without the amputation.
 ## What you need
 
 - **macOS or Linux**, with Python 3.10+
-- **mitmproxy** — `brew install mitmproxy`, or `pipx install mitmproxy`
+- **mitmproxy** — `./launch.sh` offers to install it if it is missing
 - **Codex** — the ChatGPT desktop app, or the `codex` CLI
 - **A local model** served over an OpenAI-compatible API
 
-Codex Local itself has no Python dependencies. mitmproxy runs as its own binary.
+Codex Local itself has no Python dependencies. mitmproxy runs as its own binary,
+installed via Homebrew, pipx or uv depending on what you already have.
+
+It **offers** rather than installs: this tool generates a private CA and proxies
+your traffic, so it has no business putting software on your machine without
+being asked. Decline and it prints the one command to run. In a script, set
+`CODEX_LOCAL_ASSUME_YES=1` to skip the prompt, or install mitmproxy yourself
+beforehand.
 
 ## Run it
 
