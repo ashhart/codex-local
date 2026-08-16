@@ -55,6 +55,7 @@ PLUGIN_URI_PATTERN = re.compile(
     r"plugin://(?P<plugin>[A-Za-z0-9_-]+)@(?P<publisher>[A-Za-z0-9_-]+)"
 )
 MAX_PLUGIN_SKILL_INSTRUCTIONS = 96 * 1024
+LOCAL_REASONING_EFFORT_ORDER = ("none", "low", "medium", "high", "xhigh", "max")
 DEFAULT_INTERCEPTOR_RUNTIME_DIR = _runtime_dir()
 SAFE_EVENT_FIELDS = frozenset(
     {
@@ -73,6 +74,10 @@ SAFE_EVENT_FIELDS = frozenset(
         "previous_source_slot",
         "repaired_compaction_id_count",
         "repaired_local_reasoning_item_count",
+        "repaired_hosted_replay_item_count",
+        "requested_reasoning_effort",
+        "effective_reasoning_effort",
+        "supported_reasoning_levels",
         "local_label",
         "served_by",
         "transport",
@@ -82,6 +87,7 @@ SAFE_EVENT_FIELDS = frozenset(
         "bridge_overhead_ms",
         "route_to_first_byte_ms",
         "transform_ms",
+        "compaction_queue_wait_ms",
         "dispatch_ms",
         "connect_ms",
         "connection_reused",
@@ -426,6 +432,14 @@ def format_interceptor_event(event: dict[str, Any]) -> str | None:
         count = event.get("repaired_local_reasoning_item_count")
         count_text = str(count) if isinstance(count, int) else "1"
         return f"[{clock}] LOCAL ✓ removed {count_text} incompatible reasoning item(s)"
+    if event_name == "local_reasoning_effort_adapted":
+        requested = _display_token(
+            event.get("requested_reasoning_effort"), 16, fallback="unsupported"
+        )
+        effective = _display_token(
+            event.get("effective_reasoning_effort"), 16, fallback="supported"
+        )
+        return f"[{clock}] LOCAL ↘ reasoning {requested} → {effective}"
     if event_name == "doom_loop_detected":
         name = _display_token(event.get("loop_tool_name"), 40, fallback="a tool")
         action = _display_token(event.get("loop_guard_action"), 12, fallback="observed")
@@ -954,8 +968,10 @@ def should_route_responses_locally(
     A hosted compaction returns ciphertext in ``encrypted_content``, which a
     local model cannot read, while hijacking a cloud task's compaction breaks
     normal hosted-model traffic. Transports with conversational state therefore
-    pass ``compaction_owner_local``; callers without it retain legacy local
-    compaction behaviour.
+    pass ``compaction_owner_local``. An unknown owner stays hosted: sending a
+    cloud task to the local compactor creates plaintext ``encrypted_content``
+    that OpenAI will reject on its next turn, while the normal local path has a
+    prompt-cache or response affinity by the time compaction begins.
     """
     if local_slot is None:
         return True
@@ -972,13 +988,14 @@ def should_route_responses_locally(
             # Conversely, a cloud task must never have its compaction hijacked
             # by the local upstream.  The transport tracks the last ordinary
             # inference route for this conversation and supplies that affinity.
-            # ``None`` preserves the legacy behaviour for callers without
-            # conversational state (and for the first local compaction).
+            # An unknown owner must fail safe to the requested hosted route.
+            # Treating unknown as local is what allowed an unrelated local chat
+            # to poison a cloud task after a WebSocket reconnect.
             if payload.get("generate") is False:
                 return False
             if compaction_owner_local is not None:
                 return compaction_owner_local
-            return True
+            return False
     return False
 
 
@@ -1076,6 +1093,12 @@ def adapt_gpt_56_pro_request(payload: Any) -> tuple[Any, bool]:
     return patched, True
 
 
+# Headroom left below the advertised window when telling Codex where to
+# auto-compact. The compaction turn carries the whole conversation plus its
+# summarising instruction, so it needs room to run inside the same window.
+AUTO_COMPACT_BUFFER_TOKENS = 32_000
+
+
 def adapt_model_catalog_for_local_tools(
     payload: Any,
     *,
@@ -1083,6 +1106,7 @@ def adapt_model_catalog_for_local_tools(
     display_name: str | None = None,
     description: str | None = None,
     context_window: int | None = None,
+    reasoning_effort_map: dict[str, str] | None = None,
 ) -> tuple[Any, int]:
     """Make a passing Codex model catalogue request ordinary native tools.
 
@@ -1133,10 +1157,140 @@ def adapt_model_catalog_for_local_tools(
                     if model.get(field) != context_window:
                         model[field] = context_window
                         changed = True
+                # The window alone was not enough: Codex carries a separate
+                # `auto_compact_token_limit`, which arrives null for this slot
+                # and left the client compacting on its own default. Measured
+                # against a 128000-token hosted slot, compaction fired between
+                # 107k and 120k tokens while the local model had a million
+                # available. Set the limit explicitly, keeping a buffer so the
+                # summarising turn itself still fits.
+                compact_limit = max(
+                    1, context_window - AUTO_COMPACT_BUFFER_TOKENS
+                )
+                if model.get("auto_compact_token_limit") != compact_limit:
+                    model["auto_compact_token_limit"] = compact_limit
+                    changed = True
+            supported_efforts = _ordered_local_reasoning_efforts(
+                reasoning_effort_map
+            )
+            if supported_efforts:
+                existing_levels = model.get("supported_reasoning_levels")
+                descriptions = {
+                    item.get("effort"): item.get("description")
+                    for item in (
+                        existing_levels if isinstance(existing_levels, list) else []
+                    )
+                    if isinstance(item, dict)
+                    and isinstance(item.get("effort"), str)
+                }
+                adapted_levels = [
+                    {
+                        "effort": effort,
+                        "description": descriptions.get(effort)
+                        or _local_reasoning_effort_description(effort),
+                    }
+                    for effort in supported_efforts
+                ]
+                if existing_levels != adapted_levels:
+                    model["supported_reasoning_levels"] = adapted_levels
+                    changed = True
+                default_effort = model.get("default_reasoning_level")
+                if default_effort not in supported_efforts:
+                    effective_default = _clamp_local_reasoning_effort(
+                        default_effort if isinstance(default_effort, str) else "high",
+                        supported_efforts,
+                    )
+                    if model.get("default_reasoning_level") != effective_default:
+                        model["default_reasoning_level"] = effective_default
+                        changed = True
         if changed:
             model["include_skills_usage_instructions"] = True
             count += 1
     return patched, count
+
+
+def adapt_local_reasoning_effort(
+    payload: Any,
+    reasoning_effort_map: dict[str, str] | None,
+) -> tuple[str | None, str | None]:
+    """Apply a private model's declared reasoning controls in place.
+
+    Codex's claimed hosted slot can expose efforts the selected local model does
+    not support. Forwarding one anyway is both undefined and expensive: the
+    recorded DeepSeek task sent ``xhigh`` even though its Pi profile explicitly
+    disables that level. Unsupported values are clamped without escalating
+    compute (``xhigh`` therefore becomes ``high`` when both ``high`` and ``max``
+    are available), then mapped to the provider-specific wire value.
+    """
+    if not isinstance(payload, dict) or not reasoning_effort_map:
+        return None, None
+    reasoning = payload.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return None, None
+    requested = reasoning.get("effort")
+    if not isinstance(requested, str) or not requested:
+        return None, None
+    supported = _ordered_local_reasoning_efforts(reasoning_effort_map)
+    if not supported:
+        return requested, requested
+    selected = (
+        requested
+        if requested in reasoning_effort_map
+        else _clamp_local_reasoning_effort(requested, supported)
+    )
+    effective = reasoning_effort_map.get(selected, selected)
+    reasoning["effort"] = effective
+    return requested, effective
+
+
+def _ordered_local_reasoning_efforts(
+    reasoning_effort_map: dict[str, str] | None,
+) -> list[str]:
+    if not reasoning_effort_map:
+        return []
+    return [
+        effort
+        for effort in LOCAL_REASONING_EFFORT_ORDER
+        if isinstance(reasoning_effort_map.get(effort), str)
+        and bool(reasoning_effort_map[effort])
+    ]
+
+
+def _clamp_local_reasoning_effort(requested: str, supported: Iterable[str]) -> str:
+    supported_set = set(supported)
+    ordered = [
+        effort for effort in LOCAL_REASONING_EFFORT_ORDER if effort in supported_set
+    ]
+    if not ordered:
+        return requested
+    if requested in ordered:
+        return requested
+    try:
+        requested_index = LOCAL_REASONING_EFFORT_ORDER.index(requested)
+    except ValueError:
+        return "high" if "high" in ordered else ordered[-1]
+    # Never turn an unsupported setting into more hidden model work. Prefer the
+    # strongest supported level at or below the request, then the lightest one
+    # above it only when the model has no lower setting at all.
+    lower = [
+        effort
+        for effort in ordered
+        if LOCAL_REASONING_EFFORT_ORDER.index(effort) <= requested_index
+    ]
+    if lower:
+        return lower[-1]
+    return ordered[0]
+
+
+def _local_reasoning_effort_description(effort: str) -> str:
+    return {
+        "none": "Fastest responses without an extended reasoning phase",
+        "low": "Fast responses with lighter reasoning",
+        "medium": "Balances speed and reasoning depth for everyday tasks",
+        "high": "Greater reasoning depth for complex problems",
+        "xhigh": "Extra high reasoning depth for complex problems",
+        "max": "Maximum reasoning depth for the hardest tasks (slowest)",
+    }.get(effort, f"Local model reasoning effort: {effort}")
 
 
 # Doom-loop guard, calibrated against 56 recorded Codex sessions. Repeating one
@@ -1149,6 +1303,11 @@ def adapt_model_catalog_for_local_tools(
 LOOP_WINDOW_ITEMS = 80
 LOOP_NUDGE_REPEATS = 12
 LOOP_BLOCK_REPEATS = 20
+# Repeating an identical deferred-catalog query is never productive polling:
+# its result is a catalog snapshot, not evolving process state. Give the model
+# one correction, then force it to explain the missing capability.
+TOOL_SEARCH_NUDGE_REPEATS = 2
+TOOL_SEARCH_BLOCK_REPEATS = 3
 LOOP_GUARD_MODES = frozenset({"off", "observe", "guard"})
 
 
@@ -1172,42 +1331,95 @@ def detect_tool_call_loop(
     calls: dict[tuple[str, str], list[str | None]] = {}
     order: list[tuple[str, str]] = []
     outputs: dict[str, str] = {}
+    seen_call_ids: set[str] = set()
     for item in tail:
         if not isinstance(item, dict):
             continue
-        if item.get("type") in {"function_call_output", "tool_call_output"}:
+        item_type = item.get("type")
+        if item_type in {
+            "function_call_output",
+            "tool_call_output",
+            "custom_tool_call_output",
+            "tool_search_output",
+        }:
             call_id = item.get("call_id")
             if isinstance(call_id, str):
+                if item_type == "tool_search_output":
+                    output = item.get("tools", item)
+                else:
+                    output = (
+                        item.get("output")
+                        if "output" in item
+                        else item.get("content")
+                    )
                 outputs[call_id] = _stringify_context_value(
-                    item.get("output") if "output" in item else item.get("content")
+                    output
                 )[:2000]
             continue
-        if item.get("type") not in {"function_call", "custom_tool_call"}:
+        if item_type not in {
+            "function_call",
+            "custom_tool_call",
+            "tool_search_call",
+        }:
             continue
-        name = item.get("name")
+        name = "tool_search" if item_type == "tool_search_call" else item.get("name")
         if not isinstance(name, str) or not name:
             continue
-        arguments = item.get("arguments") if "arguments" in item else item.get("input")
+        arguments = (
+            item.get("arguments") if "arguments" in item else item.get("input")
+        )
+        if item_type == "tool_search_call" and not isinstance(arguments, dict):
+            query = item.get("query")
+            arguments = {"query": query} if isinstance(query, str) else {}
         signature = (name, _stringify_context_value(arguments)[:4000])
         if signature not in calls:
             calls[signature] = []
             order.append(signature)
         call_id = item.get("call_id")
+        if isinstance(call_id, str) and call_id in seen_call_ids:
+            # Codex's expanded WebSocket state can carry both the added and
+            # completed form of one call. They share a call_id and represent
+            # one execution, not two loop iterations.
+            continue
+        if isinstance(call_id, str):
+            seen_call_ids.add(call_id)
         calls[signature].append(call_id if isinstance(call_id, str) else None)
     for signature in order:
         call_ids = calls[signature]
-        if len(call_ids) < threshold:
+        if signature[0] == "tool_search":
+            # The WebSocket reconstruction can retain a local response item and
+            # receive Codex's echo of that item under a second call_id. Exactly
+            # one of them has the client-produced tool_search_output, so count
+            # completed executions rather than advertised call records.
+            completed_ids = [call_id for call_id in call_ids if call_id in outputs]
+            repeats = len(completed_ids)
+        else:
+            completed_ids = call_ids
+            repeats = len(call_ids)
+        required_repeats = (
+            TOOL_SEARCH_NUDGE_REPEATS
+            if signature[0] == "tool_search"
+            else threshold
+        )
+        if repeats < required_repeats:
             continue
-        seen = [outputs.get(call_id) for call_id in call_ids if call_id in outputs]
+        seen = [
+            outputs.get(call_id)
+            for call_id in completed_ids
+            if call_id in outputs
+        ]
         identical_outputs = len(seen) > 1 and len(set(seen)) == 1
-        return {
+        detection = {
             "name": signature[0],
-            "repeats": len(call_ids),
+            "repeats": repeats,
             "identical_outputs": identical_outputs,
             "arguments_digest": hashlib.sha256(
                 signature[1].encode("utf-8")
             ).hexdigest()[:16],
         }
+        if signature[0] == "tool_search":
+            detection["block_repeats"] = TOOL_SEARCH_BLOCK_REPEATS
+        return detection
     return None
 
 
@@ -1237,6 +1449,7 @@ def detect_churn_run(
     tail = value[-window:] if window > 0 else value
     outputs: dict[str, str] = {}
     calls: list[tuple[str, str, str | None]] = []
+    seen_call_ids: set[str] = set()
     for item in tail:
         if not isinstance(item, dict):
             continue
@@ -1254,6 +1467,10 @@ def detect_churn_run(
             continue
         arguments = item.get("arguments") if "arguments" in item else item.get("input")
         call_id = item.get("call_id")
+        if isinstance(call_id, str) and call_id in seen_call_ids:
+            continue
+        if isinstance(call_id, str):
+            seen_call_ids.add(call_id)
         calls.append(
             (
                 name,
@@ -1331,7 +1548,8 @@ def apply_loop_guard(
         return payload, None
     repeats = detection.get("repeats", 0)
     churn = detection.get("kind") == "churn"
-    threshold = CHURN_BLOCK_RUN if churn else block_repeats
+    configured_block_repeats = detection.get("block_repeats", block_repeats)
+    threshold = CHURN_BLOCK_RUN if churn else configured_block_repeats
     blocking = isinstance(repeats, int) and repeats >= threshold
     outcome = "no progress" if detection.get("identical_outputs") else "the same way"
     shape = (
@@ -1993,6 +2211,48 @@ def normalize_invalid_local_reasoning_items(value: Any) -> tuple[Any, int]:
 
     normalized, count, _ = visit(value)
     return normalized, count
+
+
+def sanitize_hosted_replay_request(value: Any) -> tuple[Any, int]:
+    """Remove local-only fields before replaying expanded history to Codex.
+
+    WebSocket turns sent to a local server are expanded into stateless full
+    history. When a hosted tool is selected, that reconstructed history is
+    replayed through the original Codex socket. The hosted input schema does
+    not accept a top-level ``summary`` field on an input item, even though old
+    or local response shapes may have persisted one. Hosted reasoning state is
+    useful only when it carries opaque encrypted content; unencrypted local
+    reasoning is therefore omitted rather than sent across the trust boundary.
+
+    Only direct members of ``input`` are changed. Request-level reasoning
+    options and nested function/tool payloads may legitimately use the key
+    ``summary`` and are deliberately preserved.
+    """
+    if not isinstance(value, dict):
+        return value, 0
+    transformed = copy.deepcopy(value)
+    input_items = transformed.get("input")
+    if not isinstance(input_items, list):
+        return transformed, 0
+
+    repaired = 0
+    kept: list[Any] = []
+    for item in input_items:
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+        if item.get("type") == "reasoning" and not (
+            isinstance(item.get("encrypted_content"), str)
+            and bool(item["encrypted_content"])
+        ):
+            repaired += 1
+            continue
+        if "summary" in item:
+            item.pop("summary", None)
+            repaired += 1
+        kept.append(item)
+    transformed["input"] = kept
+    return transformed, repaired
 
 
 def adapt_compaction_response(value: Any) -> tuple[Any, bool]:
@@ -2657,7 +2917,11 @@ def response_is_empty(value: Any) -> bool:
     for item in output:
         if not isinstance(item, dict):
             continue
-        if item.get("type") in {"function_call", "custom_tool_call"}:
+        if item.get("type") in {
+            "function_call",
+            "custom_tool_call",
+            "compaction",
+        }:
             return False
         if extract_response_text({"output": [item]}).strip():
             return False
@@ -2869,6 +3133,99 @@ def extract_namespace_tools(payload: dict[str, Any]) -> dict[str, set[str]]:
     return namespaces
 
 
+def advertised_tool_contract_violations(payload: dict[str, Any]) -> list[str]:
+    """Validate every Codex tool before compatibility transforms run.
+
+    Unknown *named* Responses tool types are valid: they are intentionally
+    classified as hosted tools later. This check is about structural coverage,
+    especially namespace members, which must never be silently dropped while a
+    request is flattened for an OpenAI-compatible local server.
+    """
+    tools = payload.get("tools")
+    if tools is None:
+        return []
+    if not isinstance(tools, list):
+        return ["tools_not_array"]
+    violations: list[str] = []
+    top_level_function_names: set[str] = set()
+    for index, tool in enumerate(tools):
+        label = f"tool[{index}]"
+        if not isinstance(tool, dict):
+            violations.append(f"{label}_not_object")
+            continue
+        tool_type = tool.get("type")
+        if not isinstance(tool_type, str) or not tool_type:
+            violations.append(f"{label}_type_missing")
+            continue
+        name = tool.get("name")
+        if tool_type in {"function", "custom"}:
+            if not isinstance(name, str) or not name:
+                violations.append(f"{label}_{tool_type}_name_missing")
+                continue
+            if tool_type == "function":
+                if name in top_level_function_names:
+                    violations.append(f"{label}_duplicate_function_name")
+                top_level_function_names.add(name)
+        if tool_type != "namespace":
+            continue
+        if not isinstance(name, str) or not name:
+            violations.append(f"{label}_namespace_name_missing")
+        members = tool.get("tools")
+        if not isinstance(members, list):
+            violations.append(f"{label}_namespace_tools_not_array")
+            continue
+        member_names: set[str] = set()
+        for member_index, member in enumerate(members):
+            member_label = f"{label}.tool[{member_index}]"
+            if not isinstance(member, dict):
+                violations.append(f"{member_label}_not_object")
+                continue
+            if member.get("type") != "function":
+                violations.append(f"{member_label}_unsupported_type")
+                continue
+            member_name = member.get("name")
+            if not isinstance(member_name, str) or not member_name:
+                violations.append(f"{member_label}_function_name_missing")
+                continue
+            if member_name in member_names:
+                violations.append(f"{member_label}_duplicate_function_name")
+            member_names.add(member_name)
+    return violations
+
+
+def local_tool_contract_violations(payload: dict[str, Any]) -> list[str]:
+    """Verify that every tool sent to a local model is a unique function.
+
+    Local servers vary in their support for Responses-specific tool records,
+    but they consistently compile ordinary ``function`` definitions. The
+    namespace, client-tool, and hosted-tool transforms must therefore leave no
+    other advertised type behind.
+    """
+    tools = payload.get("tools")
+    if tools is None:
+        return []
+    if not isinstance(tools, list):
+        return ["tools_not_array"]
+    violations: list[str] = []
+    names: set[str] = set()
+    for index, tool in enumerate(tools):
+        label = f"tool[{index}]"
+        if not isinstance(tool, dict):
+            violations.append(f"{label}_not_object")
+            continue
+        if tool.get("type") != "function":
+            violations.append(f"{label}_not_local_function")
+            continue
+        name = tool.get("name")
+        if not isinstance(name, str) or not name:
+            violations.append(f"{label}_function_name_missing")
+            continue
+        if name in names:
+            violations.append(f"{label}_duplicate_function_name")
+        names.add(name)
+    return violations
+
+
 def flatten_namespace_tools_for_local_model(
     payload: dict[str, Any],
 ) -> tuple[dict[str, Any], set[str]]:
@@ -3021,6 +3378,143 @@ def expose_client_tools_for_local_model(
         exposed.append(tool)
     payload["tools"] = exposed
     return payload, mappings, names
+
+
+LOCAL_MODEL_NATIVE_TOOL_TYPES = {
+    "custom",
+    "function",
+    "namespace",
+    "tool_search",
+}
+
+
+def hosted_tool_types_in_request(payload: dict[str, Any]) -> set[str]:
+    """Return Responses tool types that require OpenAI-hosted execution."""
+    return {
+        tool_type
+        for tool in payload.get("tools", [])
+        if isinstance(tool, dict)
+        and isinstance((tool_type := tool.get("type")), str)
+        and tool_type
+        and tool_type not in LOCAL_MODEL_NATIVE_TOOL_TYPES
+    }
+
+
+def expose_hosted_tools_for_local_model(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], set[str]]:
+    """Expose OpenAI-hosted tools as local compatibility functions.
+
+    Built-in Responses tools such as ``web_search`` are executed inside the
+    OpenAI response, while ordinary function calls are executed by the Codex
+    client.  A local OpenAI-compatible server cannot execute those built-ins,
+    and if its model emits ``function_call(name="web_search")`` Codex quite
+    correctly rejects it as an unsupported client call.
+
+    The WebSocket bridge uses the returned names only as handoff signals: the
+    local call is never shown to Codex.  Instead, the complete original turn is
+    replayed over Codex's still-authenticated hosted connection, where the
+    advertised built-in retains its native type and can actually run.
+    """
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return payload, set()
+    used = {
+        tool["name"]
+        for tool in tools
+        if isinstance(tool, dict)
+        and tool.get("type") == "function"
+        and isinstance(tool.get("name"), str)
+        and tool["name"]
+    }
+    exposed: list[Any] = []
+    names: set[str] = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            exposed.append(tool)
+            continue
+        tool_type = tool.get("type")
+        if (
+            not isinstance(tool_type, str)
+            or not tool_type
+            or tool_type in LOCAL_MODEL_NATIVE_TOOL_TYPES
+        ):
+            exposed.append(tool)
+            continue
+        preferred = _hosted_tool_function_name(tool)
+        name = _unique_tool_name(preferred, used)
+        used.add(name)
+        names.add(name)
+        exposed.append(
+            {
+                "type": "function",
+                "name": name,
+                "description": (
+                    f"Invoke Codex's hosted `{tool_type}` tool for this turn. "
+                    "Use the normal arguments for the requested operation. The "
+                    "bridge will hand the complete turn to Codex so the tool is "
+                    "executed by its native hosted backend. If this tool is "
+                    "needed, call it as the first output item before emitting "
+                    "assistant text or any other tool call."
+                ),
+                "strict": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "queries": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "url": {"type": "string"},
+                        "pattern": {"type": "string"},
+                        "prompt": {"type": "string"},
+                    },
+                    "additionalProperties": True,
+                },
+            }
+        )
+    payload["tools"] = exposed
+    return payload, names
+
+
+def _hosted_tool_function_name(tool: dict[str, Any]) -> str:
+    explicit = tool.get("name")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    tool_type = str(tool.get("type") or "hosted_tool")
+    return re.sub(r"_\d{4}_\d{2}_\d{2}$", "", tool_type)
+
+
+def hosted_tool_calls_in_response(
+    value: Any,
+    hosted_tool_names: Iterable[str],
+) -> list[str]:
+    """Return hosted compatibility functions actually emitted by a model."""
+    names = {
+        name for name in hosted_tool_names if isinstance(name, str) and name
+    }
+    found: list[str] = []
+
+    def visit(node: Any) -> None:
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+            return
+        if not isinstance(node, dict):
+            return
+        name = node.get("name")
+        if (
+            node.get("type") == "function_call"
+            and name in names
+            and name not in found
+        ):
+            found.append(name)
+        for item in node.values():
+            visit(item)
+
+    visit(value)
+    return found
 
 
 def _unique_tool_name(preferred: str, used: set[str]) -> str:
@@ -4095,6 +4589,80 @@ def pi_model_context_window(
                 return window
             matches.append(window)
     return min(matches) if matches else None
+
+
+def pi_model_reasoning_effort_map(
+    model: str,
+    *,
+    server: str | None = None,
+    models_path: str | Path | None = None,
+) -> dict[str, str] | None:
+    """Return Pi's model-specific thinking controls in Responses terminology.
+
+    Pi treats ordinary levels through ``high`` as identity-mapped unless a
+    model explicitly marks one ``null``. Extended ``xhigh`` and ``max`` levels
+    are opt-in. Pi calls disabled reasoning ``off``; the Responses API calls the
+    same effort ``none``.
+    """
+    if not isinstance(model, str) or not model:
+        return None
+    try:
+        catalog = _read_pi_catalog(_pi_models_path(models_path))
+    except (OSError, ValueError, PermissionError, json.JSONDecodeError):
+        return None
+    providers = catalog.get("providers")
+    if not isinstance(providers, dict):
+        return None
+    matches: list[dict[str, str]] = []
+    for provider, definition in providers.items():
+        if not isinstance(definition, dict):
+            continue
+        for item in definition.get("models", []):
+            if not isinstance(item, dict) or item.get("id") != model:
+                continue
+            profile = _pi_reasoning_effort_map_from_model(item)
+            if profile is None:
+                continue
+            if server is not None and provider == server:
+                return profile
+            matches.append(profile)
+    if not matches:
+        return None
+    # Without a server hint, advertise only controls every matching endpoint
+    # supports. Different devices may serve the same model id with different
+    # chat templates.
+    shared = set(matches[0])
+    for profile in matches[1:]:
+        shared.intersection_update(profile)
+    return {
+        effort: matches[0][effort]
+        for effort in LOCAL_REASONING_EFFORT_ORDER
+        if effort in shared
+        and all(profile.get(effort) == matches[0][effort] for profile in matches)
+    } or None
+
+
+def _pi_reasoning_effort_map_from_model(item: dict[str, Any]) -> dict[str, str] | None:
+    if item.get("reasoning") is False:
+        return {"none": "none"}
+    raw_map = item.get("thinkingLevelMap")
+    if raw_map is None:
+        return None
+    if not isinstance(raw_map, dict):
+        return None
+    profile: dict[str, str] = {}
+    off = raw_map.get("off", "none")
+    if off is not None:
+        profile["none"] = off if isinstance(off, str) and off else "none"
+    for effort in ("low", "medium", "high"):
+        mapped = raw_map.get(effort, effort)
+        if isinstance(mapped, str) and mapped:
+            profile[effort] = mapped
+    for effort in ("xhigh", "max"):
+        mapped = raw_map.get(effort)
+        if isinstance(mapped, str) and mapped:
+            profile[effort] = mapped
+    return profile or None
 
 
 def _pi_models_path(models_path: str | Path | None) -> Path:
