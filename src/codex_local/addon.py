@@ -58,7 +58,6 @@ from codex_local.audit import (  # noqa: E402
     redact_cloud_request_body,
 )
 from codex_local.routing import (  # noqa: E402
-    GPT_56_PRO_ALIAS,
     canonical_digest,
     LOOP_GUARD_MODES,
     SSEUsageObserver,
@@ -69,16 +68,19 @@ from codex_local.routing import (  # noqa: E402
     SSEToolNameNormalizer,
     SENSITIVE_HEADER_NAMES,
     adapt_gpt_56_pro_request,
+    adapt_local_reasoning_effort,
     adapt_model_catalog_for_local_tools,
     add_gpt_56_pro_catalog_entry,
     adapt_client_tool_call_sse,
     adapt_textual_tool_call_sse,
     adapt_compaction_response,
     adapt_compaction_sse_response,
+    advertised_tool_contract_violations,
     compaction_response_sse,
     extract_advertised_tools,
     extract_namespace_tools,
     expose_client_tools_for_local_model,
+    expose_hosted_tools_for_local_model,
     flatten_namespace_tools_for_local_model,
     input_type_counts,
     is_compaction_request,
@@ -86,6 +88,7 @@ from codex_local.routing import (  # noqa: E402
     is_intercepted_request,
     is_intercepted_websocket,
     local_incompatible_input_item_count,
+    local_tool_contract_violations,
     opaque_compaction_item_count,
     response_is_empty,
     repair_local_request,
@@ -96,10 +99,13 @@ from codex_local.routing import (  # noqa: E402
     non_array_content_item_count,
     normalize_invalid_local_reasoning_items,
     normalize_client_tool_calls,
+    hosted_tool_calls_in_response,
+    hosted_tool_types_in_request,
     normalize_response_tool_names,
     normalize_legacy_compaction_item_ids,
     responses_request_model,
     sanitize_local_response_items,
+    sanitize_hosted_replay_request,
     select_lowest_visible_codex_model,
     should_route_responses_locally,
     describe_rejected_request,
@@ -175,6 +181,58 @@ class LocalUpstreamHTTPError(RuntimeError):
     def __init__(self, code: int, message: str) -> None:
         super().__init__(message)
         self.code = code
+        self.request_detail: dict[str, Any] = {}
+
+
+class _HostedToolStreamGate:
+    """Delay only the undecided prefix of a hosted-tool-capable response.
+
+    Codex advertises hosted tools such as ``web_search`` on ordinary turns even
+    when the model never uses them. Buffering the complete response merely
+    because one is available makes a healthy token stream appear frozen. Keep
+    the non-visible response envelope private until the first actionable item:
+    an immediate hosted compatibility call remains safe to replay remotely,
+    while text or a client-side tool commits the response to the local stream.
+    """
+
+    def __init__(self, hosted_tool_names: set[str], emit_event) -> None:
+        self.hosted_tool_names = hosted_tool_names
+        self.emit_event = emit_event
+        self.pending: list[dict[str, Any]] = []
+        self.handoff_names: list[str] = []
+        self.late_handoff_names: list[str] = []
+        self.local_stream_committed = False
+
+    def accept(self, event: dict[str, Any]) -> None:
+        calls = hosted_tool_calls_in_response(event, self.hosted_tool_names)
+        if calls and not self.local_stream_committed:
+            for name in calls:
+                if name not in self.handoff_names:
+                    self.handoff_names.append(name)
+            self.pending.clear()
+            return
+        if self.handoff_names:
+            return
+        if calls:
+            for name in calls:
+                if name not in self.late_handoff_names:
+                    self.late_handoff_names.append(name)
+        if self.local_stream_committed:
+            self.emit_event(event)
+            return
+        self.pending.append(event)
+        if _is_visible_response_event(event) or event.get("type") == "response.completed":
+            self.local_stream_committed = True
+            self.flush()
+
+    def flush(self) -> None:
+        pending, self.pending = self.pending, []
+        for event in pending:
+            self.emit_event(event)
+
+    def finish(self) -> None:
+        if not self.handoff_names:
+            self.flush()
 
 
 def _is_prompt_size_rejection(status: Any) -> bool:
@@ -375,10 +433,24 @@ class CodexLocalInterceptor:
         self.local_context_window = _positive_int_env(
             "CODEX_LOCAL_LOCAL_CONTEXT_WINDOW"
         )
+        self.local_reasoning_effort_map = _string_map_env(
+            "CODEX_LOCAL_REASONING_EFFORT_MAP"
+        )
         self.websocket_states: dict[str, ResponsesWebSocketState] = {}
         self.websocket_route_affinity: "OrderedDict[str, bool]" = OrderedDict()
-        self._http_last_inference_route_local: bool | None = None
+        self.websocket_conversation_affinity: "OrderedDict[str, bool]" = OrderedDict()
+        # HTTP fallback and every physical WebSocket share task affinity. Codex
+        # is free to reconnect a task or change transports between turns; its
+        # prompt_cache_key remains the logical stream identity.
+        self.http_route_state = ResponsesWebSocketState(
+            route_affinity=self.websocket_route_affinity,
+            conversation_affinity=self.websocket_conversation_affinity,
+        )
         self.websocket_tasks: set[asyncio.Task] = set()
+        # Compaction can consume the whole model for minutes. Keep one
+        # maintenance generation in flight per bridge event loop without
+        # serializing ordinary turns from independent tasks.
+        self._compaction_locks: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
         capabilities_path = os.environ.get("CODEX_LOCAL_CAPABILITIES_PATH")
         self.capabilities_path = (
             Path(capabilities_path).expanduser() if capabilities_path else None
@@ -388,7 +460,7 @@ class CodexLocalInterceptor:
         self._native_capability_reported = False
         self.prefix_prefills: "OrderedDict[str, tuple[float, str]]" = OrderedDict()
         self.prefix_prefill_enabled = os.environ.get(
-            "CODEX_LOCAL_PREFIX_PREFILL", "1"
+            "CODEX_LOCAL_PREFIX_PREFILL", "0"
         ) not in {"0", "false", "False"}
         prefix_cache_path = os.environ.get("CODEX_LOCAL_PREFIX_CACHE_PATH")
         self.prefix_cache_path = (
@@ -436,6 +508,11 @@ class CodexLocalInterceptor:
             local_slot=self.local_slot,
             code_fingerprint=self.code_fingerprint,
             advertised_context_window=self.local_context_window,
+            supported_reasoning_levels=(
+                list(self.local_reasoning_effort_map)
+                if self.local_reasoning_effort_map
+                else None
+            ),
             prefix_prefill_status=("cached" if self.prefix_prefills else "cold"),
             residency_status=(
                 "monitoring" if self.residency_keepalive_enabled else "disabled"
@@ -603,7 +680,16 @@ class CodexLocalInterceptor:
         return ResponsesWebSocketState(
             spill_dir=self.status_path.parent / "websocket-spill",
             route_affinity=self.websocket_route_affinity,
+            conversation_affinity=self.websocket_conversation_affinity,
         )
+
+    def _compaction_lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        lock = self._compaction_locks.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._compaction_locks[loop] = lock
+        return lock
 
     def _preflight_local_upstream(self) -> bool:
         """Throttled liveness check before a real local inference turn.
@@ -710,10 +796,13 @@ class CodexLocalInterceptor:
                 payload,
                 self.local_slot,
                 local_compaction=self.local_compaction,
-                compaction_owner_local=self._http_last_inference_route_local,
+                compaction_owner_local=self.http_route_state.inference_route(payload),
             )
             if not compaction_request:
-                self._http_last_inference_route_local = route_locally
+                self.http_route_state.note_inference_route(
+                    payload,
+                    local=route_locally,
+                )
             forced_local_compaction = (
                 route_locally
                 and self.local_slot is not None
@@ -745,6 +834,37 @@ class CodexLocalInterceptor:
                     local_slot=self.local_slot,
                 )
                 return
+            hosted_tool_types = hosted_tool_types_in_request(payload)
+            if hosted_tool_types and not compaction_request:
+                # An HTTP response cannot be withdrawn after a local model has
+                # streamed an OpenAI-hosted compatibility call. The normal app
+                # and CLI path uses the WebSocket bridge and hands off only if
+                # the model actually calls one; on this fallback transport,
+                # preserve correctness by keeping the complete turn hosted.
+                self.http_route_state.note_inference_route(payload, local=False)
+                flow.metadata["codex_local_remote_inference"] = True
+                flow.metadata["codex_local_requested_model"] = requested_model
+                flow.metadata["codex_local_effective_model"] = requested_model
+                flow.metadata["codex_local_pro_mode"] = False
+                self._audit_cloud_http_request(
+                    flow,
+                    model=requested_model,
+                    inference_kind="responses_hosted_tool_fallback",
+                )
+                self._record(
+                    "remote_inference_routed",
+                    original_host=original_host,
+                    original_path=safe_path,
+                    method=request.method.upper(),
+                    requested_model=requested_model,
+                    effective_model=requested_model,
+                    pro_mode=False,
+                    local_slot=self.local_slot,
+                    transport="http",
+                    fallback_reason="hosted_tool_transport",
+                    hosted_tool_types=sorted(hosted_tool_types),
+                )
+                return
             payload, repaired_compaction_ids = normalize_legacy_compaction_item_ids(
                 payload
             )
@@ -774,9 +894,30 @@ class CodexLocalInterceptor:
                 transformed, tool_names = transform_responses_request(
                     payload, self.model
                 )
+            requested_effort, effective_effort = adapt_local_reasoning_effort(
+                transformed,
+                self.local_reasoning_effort_map,
+            )
+            if requested_effort != effective_effort:
+                self._record(
+                    "local_reasoning_effort_adapted",
+                    local_model=self.model,
+                    requested_model=requested_model,
+                    transport="http",
+                    requested_reasoning_effort=requested_effort,
+                    effective_reasoning_effort=effective_effort,
+                )
             advertised_tool_names, advertised_tool_types = extract_advertised_tools(
                 transformed
             )
+            advertised_contract_errors = advertised_tool_contract_violations(
+                transformed
+            )
+            if advertised_contract_errors:
+                raise ValueError(
+                    "Codex advertised an invalid tool contract: "
+                    + ", ".join(advertised_contract_errors)
+                )
             if compaction_request:
                 transformed["stream"] = False
                 transformed.pop("stream_options", None)
@@ -787,11 +928,22 @@ class CodexLocalInterceptor:
             transformed, client_tool_mappings, client_tool_names = (
                 expose_client_tools_for_local_model(transformed)
             )
+            transformed, hosted_tool_names = expose_hosted_tools_for_local_model(
+                transformed
+            )
+            local_contract_errors = local_tool_contract_violations(transformed)
+            if local_contract_errors:
+                raise ValueError(
+                    "tool compatibility coverage is incomplete: "
+                    + ", ".join(local_contract_errors)
+                )
             local_tool_names, _ = extract_advertised_tools(
                 transformed
             )
             transformed, loop_action, loop_detection = self._guard_loop(
-                transformed, compaction_request
+                transformed,
+                compaction_request,
+                source_input=payload.get("input"),
             )
             transformed, repaired_rules = repair_local_request(transformed)
         except Exception as exc:
@@ -922,7 +1074,7 @@ class CodexLocalInterceptor:
         flow.metadata["codex_local_requested_model"] = requested_model
         flow.metadata["codex_local_registered_tools"] = sorted(tool_names)
         flow.metadata["codex_local_emittable_tools"] = sorted(
-            tool_names | flattened_names | client_tool_names
+            tool_names | flattened_names | client_tool_names | hosted_tool_names
         )
         flow.metadata["codex_local_namespace_tools"] = namespace_tools
         flow.metadata["codex_local_client_tool_mappings"] = client_tool_mappings
@@ -967,7 +1119,9 @@ class CodexLocalInterceptor:
             local_server=self.local_server,
             requested_model=requested_model,
             local_slot=self.local_slot,
-            tool_count=len(tool_names | flattened_names | client_tool_names),
+            tool_count=len(
+                tool_names | flattened_names | client_tool_names | hosted_tool_names
+            ),
             tool_names=sorted(local_tool_names),
             advertised_tool_names=sorted(advertised_tool_names),
             advertised_tool_types=sorted(advertised_tool_types),
@@ -1001,6 +1155,8 @@ class CodexLocalInterceptor:
         self,
         transformed: dict[str, Any],
         compaction: bool,
+        *,
+        source_input: Any = None,
     ) -> tuple[dict[str, Any], str | None, dict[str, Any] | None]:
         """Detect and optionally break a repeated tool call on a local turn.
 
@@ -1009,7 +1165,11 @@ class CodexLocalInterceptor:
         """
         if compaction or self.loop_guard_mode == "off":
             return transformed, None, None
-        items = transformed.get("input")
+        items = (
+            source_input
+            if isinstance(source_input, list)
+            else transformed.get("input")
+        )
         detection = detect_tool_call_loop(items) or detect_churn_run(items)
         if detection is None:
             return transformed, None, None
@@ -1115,6 +1275,10 @@ class CodexLocalInterceptor:
                 if payload is None:
                     return
                 transformed, _ = transform_responses_request(payload, self.model)
+                adapt_local_reasoning_effort(
+                    transformed,
+                    self.local_reasoning_effort_map,
+                )
                 transformed, _ = flatten_namespace_tools_for_local_model(transformed)
                 transformed, _, _ = expose_client_tools_for_local_model(transformed)
                 transformed, _ = repair_local_request(transformed)
@@ -1272,8 +1436,10 @@ class CodexLocalInterceptor:
         message = flow.websocket.messages[-1]
         if message.injected:
             return
+        state = self.websocket_states.setdefault(flow.id, self._new_websocket_state())
         if not message.is_text:
-            if flow.metadata.get("codex_local_ws_remote_model"):
+            remote_turn = state.remote_response_for_event(None)
+            if remote_turn is not None:
                 self._audit_cloud_bytes(
                     "cloud.websocket.frame",
                     _websocket_message_bytes(message),
@@ -1285,13 +1451,14 @@ class CodexLocalInterceptor:
                     ),
                     transport="websocket",
                     opcode="binary",
-                    model=flow.metadata.get("codex_local_ws_remote_model"),
+                    model=remote_turn.get("effective_model"),
                 )
             return
         try:
             payload = json.loads(message.content)
         except (UnicodeDecodeError, json.JSONDecodeError):
-            if flow.metadata.get("codex_local_ws_remote_model"):
+            remote_turn = state.remote_response_for_event(None)
+            if remote_turn is not None:
                 self._audit_cloud_bytes(
                     "cloud.websocket.frame",
                     _websocket_message_bytes(message),
@@ -1303,11 +1470,12 @@ class CodexLocalInterceptor:
                     ),
                     transport="websocket",
                     opcode="text",
-                    model=flow.metadata.get("codex_local_ws_remote_model"),
+                    model=remote_turn.get("effective_model"),
                 )
             return
         if not message.from_client:
-            if flow.metadata.get("codex_local_ws_remote_model"):
+            remote_turn = state.remote_response_for_event(payload)
+            if remote_turn is not None:
                 self._audit_cloud_bytes(
                     "cloud.websocket.frame",
                     _websocket_message_bytes(message),
@@ -1316,20 +1484,17 @@ class CodexLocalInterceptor:
                     transport="websocket",
                     opcode="text",
                     message_type=payload.get("type"),
-                    model=flow.metadata.get("codex_local_ws_remote_model"),
+                    model=remote_turn.get("effective_model"),
                 )
             message_type = payload.get("type")
-            if (
-                message_type in REMOTE_RESPONSE_TERMINAL_TYPES
-                and flow.metadata.get("codex_local_ws_remote_model")
-            ):
-                response = payload.get("response")
-                response_id = response.get("id") if isinstance(response, dict) else None
-                state = self.websocket_states.get(flow.id)
-                if state is not None:
-                    state.bind_response_route(response_id, local=False)
-                requested_model = flow.metadata.pop("codex_local_ws_remote_model", None)
-                started = flow.metadata.pop("codex_local_ws_remote_at", time.monotonic())
+            if message_type in REMOTE_RESPONSE_TERMINAL_TYPES:
+                completed_turn = state.finish_remote_response(payload)
+                if completed_turn is None:
+                    return
+                requested_model = completed_turn.get("requested_model")
+                started = completed_turn.get("started_at")
+                if not isinstance(started, (int, float)):
+                    started = time.monotonic()
                 event = (
                     "remote_inference_completed"
                     if message_type == "response.completed"
@@ -1349,7 +1514,8 @@ class CodexLocalInterceptor:
                 )
             return
         if not ResponsesWebSocketState.is_response_create(payload):
-            if flow.metadata.get("codex_local_ws_remote_model"):
+            remote_turn = state.remote_response_for_event(payload)
+            if remote_turn is not None:
                 self._audit_cloud_bytes(
                     "cloud.websocket.frame",
                     _websocket_message_bytes(message),
@@ -1358,11 +1524,10 @@ class CodexLocalInterceptor:
                     transport="websocket",
                     opcode="text",
                     message_type=payload.get("type"),
-                    model=flow.metadata.get("codex_local_ws_remote_model"),
+                    model=remote_turn.get("effective_model"),
                 )
             return
         requested_model = responses_request_model(payload)
-        state = self.websocket_states.setdefault(flow.id, self._new_websocket_state())
         compaction_request = is_compaction_request(payload)
         route_locally = should_route_responses_locally(
             payload,
@@ -1371,16 +1536,19 @@ class CodexLocalInterceptor:
             compaction_owner_local=state.inference_route(payload),
         )
         if not compaction_request and not state.is_prewarm(payload):
-            state.note_inference_route(local=route_locally)
+            state.note_inference_route(payload, local=route_locally)
         if not route_locally:
             outbound, pro_mode = adapt_gpt_56_pro_request(payload)
             if pro_mode:
                 message.content = _json_bytes(outbound)
             effective_model = responses_request_model(outbound)
-            flow.metadata["codex_local_ws_remote_model"] = requested_model
-            flow.metadata["codex_local_ws_effective_model"] = effective_model
-            flow.metadata["codex_local_ws_pro_mode"] = pro_mode
-            flow.metadata["codex_local_ws_remote_at"] = time.monotonic()
+            state.begin_remote_response(
+                payload,
+                requested_model=requested_model,
+                effective_model=effective_model,
+                pro_mode=pro_mode,
+                started_at=time.monotonic(),
+            )
             self._audit_cloud_bytes(
                 "cloud.websocket.frame",
                 _websocket_message_bytes(message),
@@ -1454,18 +1622,21 @@ class CodexLocalInterceptor:
         task.add_done_callback(self.websocket_tasks.discard)
 
     def websocket_end(self, flow: http.HTTPFlow) -> None:
-        self.websocket_states.pop(flow.id, None)
-        requested_model = flow.metadata.pop("codex_local_ws_remote_model", None)
-        if requested_model:
+        state = self.websocket_states.pop(flow.id, None)
+        pending = state.drain_remote_responses() if state is not None else []
+        for remote_turn in pending:
+            requested_model = remote_turn.get("requested_model")
             self._audit_cloud_bytes(
                 "cloud.websocket.lifecycle.end",
                 _json_bytes(_websocket_end_metadata(flow)),
                 flow_id=flow.id,
                 direction="transport",
                 transport="websocket",
-                model=requested_model,
+                model=remote_turn.get("effective_model"),
             )
-            started = flow.metadata.pop("codex_local_ws_remote_at", time.monotonic())
+            started = remote_turn.get("started_at")
+            if not isinstance(started, (int, float)):
+                started = time.monotonic()
             self._record(
                 "remote_inference_error",
                 requested_model=requested_model,
@@ -1488,6 +1659,7 @@ class CodexLocalInterceptor:
         request_digest: str | None = None
         try:
             expanded = state.expand(payload)
+            compaction_request = is_compaction_request(expanded)
             if is_compaction_trigger_request(expanded):
                 transformed, tool_names = transform_compaction_request(
                     expanded, self.model
@@ -1496,9 +1668,31 @@ class CodexLocalInterceptor:
                 transformed, tool_names = transform_responses_request(
                     expanded, self.model
                 )
+            requested_effort, effective_effort = adapt_local_reasoning_effort(
+                transformed,
+                self.local_reasoning_effort_map,
+            )
+            if requested_effort != effective_effort:
+                self._record(
+                    "local_reasoning_effort_adapted",
+                    local_model=self.model,
+                    requested_model=requested_model,
+                    local_slot=self.local_slot,
+                    transport="websocket_bridge",
+                    requested_reasoning_effort=requested_effort,
+                    effective_reasoning_effort=effective_effort,
+                )
             advertised_tool_names, advertised_tool_types = extract_advertised_tools(
                 transformed
             )
+            advertised_contract_errors = advertised_tool_contract_violations(
+                transformed
+            )
+            if advertised_contract_errors:
+                raise ValueError(
+                    "Codex advertised an invalid tool contract: "
+                    + ", ".join(advertised_contract_errors)
+                )
             namespace_tools = extract_namespace_tools(transformed)
             transformed, flattened_names = flatten_namespace_tools_for_local_model(
                 transformed
@@ -1506,13 +1700,29 @@ class CodexLocalInterceptor:
             transformed, client_tool_mappings, client_tool_names = (
                 expose_client_tools_for_local_model(transformed)
             )
+            transformed, hosted_tool_names = expose_hosted_tools_for_local_model(
+                transformed
+            )
+            local_contract_errors = local_tool_contract_violations(transformed)
+            if local_contract_errors:
+                raise ValueError(
+                    "tool compatibility coverage is incomplete: "
+                    + ", ".join(local_contract_errors)
+                )
             local_tool_names, _ = extract_advertised_tools(
                 transformed
             )
             transformed, loop_action, loop_detection = self._guard_loop(
-                transformed, is_compaction_request(expanded)
+                transformed,
+                compaction_request,
+                source_input=expanded.get("input"),
             )
-            emittable_tools = tool_names | flattened_names | client_tool_names
+            emittable_tools = (
+                tool_names
+                | flattened_names
+                | client_tool_names
+                | hosted_tool_names
+            )
             native_tool_streaming = bool(
                 emittable_tools and self._native_tool_streaming_enabled()
             )
@@ -1607,7 +1817,7 @@ class CodexLocalInterceptor:
                 transformed, ensure_ascii=False, separators=(",", ":")
             ).encode("utf-8")
             request_summary = summarize_responses_request(expanded, len(request_body))
-            if not is_compaction_request(expanded):
+            if not compaction_request:
                 self._schedule_prefix_prefill(
                     requested_model=requested_model,
                     transformed=transformed,
@@ -1678,38 +1888,112 @@ class CodexLocalInterceptor:
                     )
                 self._inject_websocket_event(flow, event)
 
-            events, first_byte_ms, remapped, textual_repair, replay = (
-                await self._local_sse_events(
-                    transformed,
-                    registered_tools=tool_names,
-                    namespace_tools=namespace_tools,
-                    emittable_tools=emittable_tools,
-                    client_tool_mappings=client_tool_mappings,
-                    compaction=is_compaction_request(expanded),
-                    on_event=emit_event,
-                    on_first_byte=lambda milliseconds: self._record(
-                        "inference_first_byte",
-                        local_model=self.model,
-                        local_server=self.local_server,
-                        requested_model=requested_model,
-                        local_slot=self.local_slot,
-                        transport="websocket_bridge",
-                        first_byte_ms=milliseconds,
-                    ),
-                    on_connection=record_connection,
-                    on_retry=lambda detail: self._record(
-                        "local_upstream_retry",
-                        local_model=self.model,
-                        local_server=self.local_server,
-                        requested_model=requested_model,
-                        local_slot=self.local_slot,
-                        transport="websocket_bridge",
-                        **detail,
-                    ),
-                    request_started=started,
-                    request_body=request_body,
-                )
+            hosted_stream_gate = (
+                _HostedToolStreamGate(hosted_tool_names, emit_event)
+                if hosted_tool_names
+                else None
             )
+            compaction_lock: asyncio.Lock | None = None
+            compaction_lock_acquired = False
+            compaction_queue_wait_ms = 0
+            if compaction_request:
+                compaction_lock = self._compaction_lock()
+                queued = compaction_lock.locked()
+                wait_started = time.monotonic()
+                if queued:
+                    self._record(
+                        "compaction_queued",
+                        local_model=self.model,
+                        local_server=self.local_server,
+                        requested_model=requested_model,
+                        local_slot=self.local_slot,
+                        transport="websocket_bridge",
+                    )
+                await compaction_lock.acquire()
+                compaction_lock_acquired = True
+                compaction_queue_wait_ms = max(
+                    0, round((time.monotonic() - wait_started) * 1000)
+                )
+                if queued:
+                    self._record(
+                        "compaction_dequeued",
+                        local_model=self.model,
+                        local_server=self.local_server,
+                        requested_model=requested_model,
+                        local_slot=self.local_slot,
+                        transport="websocket_bridge",
+                        compaction_queue_wait_ms=compaction_queue_wait_ms,
+                    )
+            try:
+                events, first_byte_ms, remapped, textual_repair, replay = (
+                    await self._local_sse_events(
+                        transformed,
+                        registered_tools=tool_names,
+                        namespace_tools=namespace_tools,
+                        emittable_tools=emittable_tools,
+                        client_tool_mappings=client_tool_mappings,
+                        compaction=compaction_request,
+                        # A hosted-capable turn streams once its first visible
+                        # local output commits the response. Only the short,
+                        # undecided envelope is held for a possible handoff.
+                        on_event=(
+                            hosted_stream_gate.accept
+                            if hosted_stream_gate is not None
+                            else emit_event
+                        ),
+                        on_first_byte=lambda milliseconds: self._record(
+                            "inference_first_byte",
+                            local_model=self.model,
+                            local_server=self.local_server,
+                            requested_model=requested_model,
+                            local_slot=self.local_slot,
+                            transport="websocket_bridge",
+                            first_byte_ms=milliseconds,
+                        ),
+                        on_connection=record_connection,
+                        on_retry=lambda detail: self._record(
+                            "local_upstream_retry",
+                            local_model=self.model,
+                            local_server=self.local_server,
+                            requested_model=requested_model,
+                            local_slot=self.local_slot,
+                            transport="websocket_bridge",
+                            **detail,
+                        ),
+                        request_started=started,
+                        request_body=request_body,
+                        buffer_events=False,
+                    )
+                )
+            finally:
+                if compaction_lock is not None and compaction_lock_acquired:
+                    compaction_lock.release()
+            hosted_calls = (
+                hosted_stream_gate.handoff_names
+                if hosted_stream_gate is not None
+                else []
+            )
+            if hosted_calls:
+                self._handoff_websocket_turn_to_hosted(
+                    flow,
+                    state,
+                    expanded,
+                    requested_model=requested_model,
+                    hosted_tool_names=hosted_calls,
+                    local_duration_ms=round((time.monotonic() - started) * 1000),
+                )
+                return
+            if hosted_stream_gate is not None:
+                hosted_stream_gate.finish()
+                if hosted_stream_gate.late_handoff_names:
+                    self._record(
+                        "hosted_tool_call_after_stream_start",
+                        local_model=self.model,
+                        requested_model=requested_model,
+                        local_slot=self.local_slot,
+                        transport="websocket_bridge",
+                        hosted_tool_names=hosted_stream_gate.late_handoff_names,
+                    )
             response_id = state.remember(expanded, events, route_local=True)
             duration_ms = round((time.monotonic() - started) * 1000)
             if textual_repair:
@@ -1749,6 +2033,9 @@ class CodexLocalInterceptor:
                 first_visible_ms=first_visible_ms or None,
                 bridge_overhead_ms=max(0, duration_ms - first_byte_ms),
                 transform_ms=transform_ms,
+                compaction_queue_wait_ms=(
+                    compaction_queue_wait_ms if compaction_request else None
+                ),
                 route_to_first_byte_ms=max(0, first_byte_ms - transform_ms),
                 **upstream_metrics,
                 tool_names_remapped=remapped,
@@ -1874,6 +2161,7 @@ class CodexLocalInterceptor:
         on_retry=None,
         request_started: float | None = None,
         request_body: bytes | None = None,
+        buffer_events: bool = False,
     ) -> tuple[list[dict[str, Any]], int, int, bool, tuple[list[bytes], int]]:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
@@ -1996,7 +2284,8 @@ class CodexLocalInterceptor:
         raw_events: list[bytes] = []
         raw_events_size = 0
         stream_directly = (
-            not compaction
+            not buffer_events
+            and not compaction
             and (
                 not emittable_tools
                 or self._native_tool_streaming_enabled()
@@ -2086,6 +2375,82 @@ class CodexLocalInterceptor:
             flow,
             True,
             json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        )
+
+    def _handoff_websocket_turn_to_hosted(
+        self,
+        flow: http.HTTPFlow,
+        state: ResponsesWebSocketState,
+        expanded: dict[str, Any],
+        *,
+        requested_model: str | None,
+        hosted_tool_names: list[str],
+        local_duration_ms: int,
+    ) -> None:
+        """Replay a locally attempted hosted-tool turn through OpenAI.
+
+        The original Codex WebSocket remains authenticated and connected while
+        local response.create frames are intercepted. Injecting the expanded
+        full-context request towards its server side therefore preserves every
+        native Codex tool without copying account credentials into a second
+        client or exposing them to the local endpoint.
+        """
+        outbound, replay_repairs = sanitize_hosted_replay_request(expanded)
+        outbound["type"] = "response.create"
+        outbound.pop("previous_response_id", None)
+        outbound.pop("stream", None)
+        outbound.pop("stream_options", None)
+        outbound, pro_mode = adapt_gpt_56_pro_request(outbound)
+        effective_model = responses_request_model(outbound)
+        encoded = json.dumps(
+            outbound, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        state.note_inference_route(expanded, local=False)
+        state.begin_remote_response(
+            expanded,
+            requested_model=requested_model,
+            effective_model=effective_model,
+            pro_mode=pro_mode,
+            started_at=time.monotonic(),
+        )
+        self._audit_cloud_bytes(
+            "cloud.websocket.frame",
+            encoded,
+            flow_id=flow.id,
+            direction="codex_to_openai",
+            transport="websocket",
+            opcode="text",
+            message_type=outbound.get("type"),
+            model=effective_model,
+            requested_model=requested_model,
+            pro_mode=pro_mode,
+            fallback_reason="hosted_tool",
+        )
+        self._audit_cloud_websocket_handshake(flow, model=effective_model)
+        ctx.master.commands.call("inject.websocket", flow, False, encoded)
+        self._record(
+            "hosted_tool_handoff",
+            local_model=self.model,
+            requested_model=requested_model,
+            effective_model=effective_model,
+            local_slot=self.local_slot,
+            transport="websocket",
+            hosted_tool_names=hosted_tool_names,
+            local_duration_ms=local_duration_ms,
+            repaired_hosted_replay_item_count=replay_repairs or None,
+        )
+        self._record(
+            "remote_inference_routed",
+            original_host=flow.metadata.get("codex_local_original_host"),
+            original_path=flow.metadata.get("codex_local_original_path"),
+            method="WEBSOCKET",
+            requested_model=requested_model,
+            effective_model=effective_model,
+            pro_mode=pro_mode,
+            local_slot=self.local_slot,
+            transport="websocket",
+            fallback_reason="hosted_tool",
+            hosted_tool_names=hosted_tool_names,
         )
 
     def responseheaders(self, flow: http.HTTPFlow) -> None:
@@ -2758,6 +3123,7 @@ class CodexLocalInterceptor:
                     else None
                 ),
                 context_window=self.local_context_window,
+                reasoning_effort_map=self.local_reasoning_effort_map,
             )
             if self.gpt_56_pro_enabled:
                 adapted, pro_count = add_gpt_56_pro_catalog_entry(adapted)
@@ -2950,6 +3316,27 @@ def _positive_int_env(name: str) -> int | None:
     except ValueError:
         return None
     return value if value > 0 else None
+
+
+def _string_map_env(name: str) -> dict[str, str] | None:
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    cleaned = {
+        key: value
+        for key, value in decoded.items()
+        if isinstance(key, str)
+        and key
+        and isinstance(value, str)
+        and value
+    }
+    return cleaned or None
 
 
 def _required_env(name: str) -> str:

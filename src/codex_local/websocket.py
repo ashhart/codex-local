@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import json
 import uuid
 from pathlib import Path
@@ -10,6 +10,7 @@ from typing import Any, Iterable
 _MAX_RETAINED_RESPONSES = 64
 _MAX_RETAINED_BYTES = 32 * 1024 * 1024
 _MAX_ROUTE_AFFINITIES = 512
+_MAX_PENDING_REMOTE_RESPONSES = 1024
 
 
 class SSEEventDecoder:
@@ -44,6 +45,7 @@ class ResponsesWebSocketState:
         *,
         spill_dir: Path | None = None,
         route_affinity: OrderedDict[str, bool] | None = None,
+        conversation_affinity: OrderedDict[str, bool] | None = None,
     ) -> None:
         self._responses: dict[str, dict[str, Any]] = {}
         self._retained_bytes = 0
@@ -53,6 +55,21 @@ class ResponsesWebSocketState:
         self._route_affinity = (
             route_affinity if route_affinity is not None else OrderedDict()
         )
+        # A response id is the strongest continuation identity, but Codex can
+        # reconnect before it receives one and standalone compaction can omit
+        # previous_response_id entirely. prompt_cache_key is stable per Codex
+        # task, so keep a second process-wide affinity index for those cases.
+        self._conversation_affinity = (
+            conversation_affinity
+            if conversation_affinity is not None
+            else OrderedDict()
+        )
+        # OpenAI WebSocket mode runs one hosted response at a time per physical
+        # connection, but clients may queue several response.create frames. A
+        # queue prevents the later frame from overwriting the earlier turn's
+        # model, timer, and response-affinity bookkeeping.
+        self._pending_remote_responses: deque[dict[str, Any]] = deque()
+        self._remote_responses_by_id: dict[str, dict[str, Any]] = {}
         self._spill_dir = spill_dir
         if spill_dir is not None:
             spill_dir.mkdir(parents=True, exist_ok=True)
@@ -63,30 +80,146 @@ class ResponsesWebSocketState:
         return self._last_inference_route_local
 
     def inference_route(self, payload: Any) -> bool | None:
-        """Resolve route affinity from the referenced conversation response."""
+        """Resolve route affinity without borrowing it from another task."""
         previous_id = (
             payload.get("previous_response_id")
             if isinstance(payload, dict)
             else None
         )
         if isinstance(previous_id, str) and previous_id in self._route_affinity:
-            route = self._route_affinity.pop(previous_id)
-            self._route_affinity[previous_id] = route
+            route = _touch_affinity(self._route_affinity, previous_id)
             return route
+        conversation_key = _conversation_affinity_key(payload)
+        if (
+            conversation_key is not None
+            and conversation_key in self._conversation_affinity
+        ):
+            route = _touch_affinity(self._conversation_affinity, conversation_key)
+            return route
+        # An explicit but unseen identity means this is a different task. Using
+        # the socket's last route here is the cross-chat affinity bug: a local
+        # turn could make a new cloud task's compaction local (or vice versa).
+        if isinstance(previous_id, str) or conversation_key is not None:
+            return None
         return self._last_inference_route_local
 
-    def note_inference_route(self, *, local: bool) -> None:
-        """Remember only real turns; callers intentionally exclude prewarms."""
+    def note_inference_route(self, payload: Any = None, *, local: bool) -> None:
+        """Remember one real turn by both socket and task identity."""
         self._last_inference_route_local = bool(local)
+        conversation_key = _conversation_affinity_key(payload)
+        if conversation_key is not None:
+            _bind_affinity(
+                self._conversation_affinity,
+                conversation_key,
+                local=local,
+            )
 
-    def bind_response_route(self, response_id: str | None, *, local: bool) -> None:
+    def bind_response_route(
+        self,
+        response_id: str | None,
+        *,
+        local: bool,
+        payload: Any = None,
+    ) -> None:
         """Bind a completed response to its route for future socket reconnects."""
-        if not isinstance(response_id, str) or not response_id:
-            return
-        self._route_affinity.pop(response_id, None)
-        self._route_affinity[response_id] = bool(local)
-        while len(self._route_affinity) > _MAX_ROUTE_AFFINITIES:
-            self._route_affinity.popitem(last=False)
+        if isinstance(response_id, str) and response_id:
+            _bind_affinity(self._route_affinity, response_id, local=local)
+        conversation_key = _conversation_affinity_key(payload)
+        if conversation_key is not None:
+            _bind_affinity(
+                self._conversation_affinity,
+                conversation_key,
+                local=local,
+            )
+
+    def begin_remote_response(
+        self,
+        payload: Any,
+        *,
+        requested_model: str | None,
+        effective_model: str | None,
+        pro_mode: bool,
+        started_at: float,
+    ) -> None:
+        """Queue one hosted response without overwriting another queued turn."""
+        turn = {
+            # Retain only the routing identity, never a second in-memory copy of
+            # a potentially megabyte-sized cloud prompt while the turn runs.
+            "route_payload": _route_identity_payload(payload),
+            "requested_model": requested_model,
+            "effective_model": effective_model,
+            "pro_mode": bool(pro_mode),
+            "started_at": started_at,
+            "response_id": None,
+        }
+        self._pending_remote_responses.append(turn)
+        while len(self._pending_remote_responses) > _MAX_PENDING_REMOTE_RESPONSES:
+            discarded = self._pending_remote_responses.popleft()
+            response_id = discarded.get("response_id")
+            if isinstance(response_id, str):
+                self._remote_responses_by_id.pop(response_id, None)
+
+    def remote_response_for_event(self, event: Any) -> dict[str, Any] | None:
+        """Return and, on response.created, identify the hosted turn for an event."""
+        response_id = _response_id_from_event(event)
+        if response_id is not None:
+            known = self._remote_responses_by_id.get(response_id)
+            if known is not None:
+                return known
+        if not self._pending_remote_responses:
+            return None
+        if (
+            isinstance(event, dict)
+            and event.get("type") == "response.created"
+            and response_id is not None
+        ):
+            turn = next(
+                (
+                    candidate
+                    for candidate in self._pending_remote_responses
+                    if candidate.get("response_id") is None
+                ),
+                None,
+            )
+            if turn is None:
+                return None
+            turn["response_id"] = response_id
+            self._remote_responses_by_id[response_id] = turn
+            self.bind_response_route(
+                response_id,
+                local=False,
+                payload=turn.get("route_payload"),
+            )
+            return turn
+        # WebSocket mode preserves server event order and executes queued
+        # responses sequentially, so an id-less error belongs to the oldest turn.
+        return self._pending_remote_responses[0]
+
+    def finish_remote_response(self, event: Any) -> dict[str, Any] | None:
+        """Remove and return the hosted turn completed by a terminal event."""
+        turn = self.remote_response_for_event(event)
+        if turn is None:
+            return None
+        response_id = _response_id_from_event(event) or turn.get("response_id")
+        if isinstance(response_id, str):
+            self._remote_responses_by_id.pop(response_id, None)
+            self.bind_response_route(
+                response_id,
+                local=False,
+                payload=turn.get("route_payload"),
+            )
+        try:
+            self._pending_remote_responses.remove(turn)
+        except ValueError:
+            pass
+        return turn
+
+    def drain_remote_responses(self) -> list[dict[str, Any]]:
+        """Return every hosted turn still pending when a socket closes."""
+        pending = list(self._pending_remote_responses)
+        self._pending_remote_responses.clear()
+        self._remote_responses_by_id.clear()
+        return pending
 
     @staticmethod
     def is_response_create(payload: Any) -> bool:
@@ -198,7 +331,11 @@ class ResponsesWebSocketState:
             response_id, stored_request, context, extra_size=_estimate_size(output_items)
         )
         if route_local is not None:
-            self.bind_response_route(response_id, local=route_local)
+            self.bind_response_route(
+                response_id,
+                local=route_local,
+                payload=request,
+            )
         return response_id
 
     def _store(
@@ -276,6 +413,61 @@ def _estimate_size(value: Any) -> int:
         )
     except (TypeError, ValueError):
         return 0
+
+
+def _conversation_affinity_key(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    prompt_cache_key = payload.get("prompt_cache_key")
+    if isinstance(prompt_cache_key, str) and prompt_cache_key:
+        return "prompt_cache_key:" + prompt_cache_key
+    client_metadata = payload.get("client_metadata")
+    if isinstance(client_metadata, dict):
+        for field in ("thread_id", "conversation_id", "task_id"):
+            value = client_metadata.get(field)
+            if isinstance(value, str) and value:
+                return f"client_metadata.{field}:" + value
+    return None
+
+
+def _route_identity_payload(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    prompt_cache_key = payload.get("prompt_cache_key")
+    if isinstance(prompt_cache_key, str) and prompt_cache_key:
+        return {"prompt_cache_key": prompt_cache_key}
+    client_metadata = payload.get("client_metadata")
+    if isinstance(client_metadata, dict):
+        for field in ("thread_id", "conversation_id", "task_id"):
+            value = client_metadata.get(field)
+            if isinstance(value, str) and value:
+                return {"client_metadata": {field: value}}
+    return None
+
+
+def _bind_affinity(
+    affinities: OrderedDict[str, bool], key: str, *, local: bool
+) -> None:
+    affinities.pop(key, None)
+    affinities[key] = bool(local)
+    while len(affinities) > _MAX_ROUTE_AFFINITIES:
+        affinities.popitem(last=False)
+
+
+def _touch_affinity(affinities: OrderedDict[str, bool], key: str) -> bool:
+    route = affinities.pop(key)
+    affinities[key] = route
+    return route
+
+
+def _response_id_from_event(event: Any) -> str | None:
+    if not isinstance(event, dict):
+        return None
+    response = event.get("response")
+    candidate = response.get("id") if isinstance(response, dict) else None
+    if not isinstance(candidate, str) or not candidate:
+        candidate = event.get("response_id")
+    return candidate if isinstance(candidate, str) and candidate else None
 
 
 def _merge_response_output(done: list[Any], completed: list[Any]) -> list[Any]:

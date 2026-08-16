@@ -9,6 +9,18 @@ dist/
 *.orig
 *.rej
 
+# Development-only. The published repository carries what is needed to run
+# Codex Local and the README, nothing else. These stay on disk so the suite and
+# the smoke tool remain usable locally, and are ignored so they cannot be
+# committed by accident.
+tests/
+tools/
+pytest.ini
+.pytest_cache/
+TESTING.md
+ARCHITECTURE.md
+config.example.json
+
 # Local model configuration carries endpoint credentials. Codex Local stores it
 # in the user config directory at mode 0600; if anyone drops a copy here it must
 # never be committed.

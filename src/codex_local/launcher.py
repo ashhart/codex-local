@@ -8,12 +8,11 @@ that child process is modified: no Codex config, no system proxy, no keychain.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import shlex
 import shutil
 import signal
@@ -40,6 +39,7 @@ from .routing import (
     load_opencode_selection,
     load_pi_selection,
     pi_model_context_window,
+    pi_model_reasoning_effort_map,
     select_lowest_visible_codex_model,
 )
 
@@ -416,14 +416,12 @@ def main() -> int:
             if not prompt:
                 raise ValueError("exec requires a prompt after --")
             codex = _required_command("codex")
-            command = [
-                codex,
-                "exec",
-                "--skip-git-repo-check",
-                "-C",
-                str(Path(args.project).expanduser().resolve()),
-                " ".join(prompt),
-            ]
+            command = _codex_exec_command(
+                codex=codex,
+                project=Path(args.project).expanduser().resolve(),
+                prompt=" ".join(prompt),
+                local_slot=local_slot,
+            )
             _update_session_receipt(runtime_dir, phase="cli_running")
             exit_code = subprocess.run(command, env=child_env, check=False).returncode
             _record_exit(runtime_dir, phase="cli_exited", exit_code=exit_code)
@@ -1654,15 +1652,15 @@ def _reap_orphaned_proxies(
     """Terminate proxies left behind by an earlier session.
 
     Each launch starts its own proxy. Three of them accumulated over two days
-    before anyone noticed, holding ports and roughly 400 MB. A proxy belonging
-    to the current session must be passed via protected_pids or the reaper
-    kills it as a false orphan.
+    before anyone noticed, holding ports and roughly 400 MB. Only an addon
+    process reparented to init is considered orphaned; a proxy whose launcher
+    is still alive may belong to another concurrent Codex Local session.
     """
     protected = (protected_pids or set()) | {os.getpid()}
     targets = (str(ADDON_PATH),)
     try:
         listing = subprocess.run(
-            ["ps", "-Ao", "pid=,command="],
+            ["ps", "-Ao", "pid=,ppid=,command="],
             stdout=subprocess.PIPE,
             text=True,
             timeout=10,
@@ -1675,12 +1673,18 @@ def _reap_orphaned_proxies(
         stripped = line.strip()
         if not stripped:
             continue
-        pid_text, _, command = stripped.partition(" ")
+        fields = stripped.split(None, 2)
+        if len(fields) != 3:
+            continue
+        pid_text, parent_text, command = fields
         try:
             pid = int(pid_text)
+            parent_pid = int(parent_text)
         except ValueError:
             continue
         if pid in protected or not any(target in command for target in targets):
+            continue
+        if parent_pid != 1:
             continue
         reaped.append({"pid": pid, "kind": "proxy"})
         if dry_run:
@@ -1721,6 +1725,36 @@ def _local_context_window(
             return value
     return pi_model_context_window(
         selection.model, server=selection.server, models_path=models_path
+    )
+
+
+def _local_reasoning_effort_map(
+    selection, *, models_path: str | Path | None = None
+) -> dict[str, str] | None:
+    """Resolve the reasoning controls the selected private model declares."""
+    override = os.environ.get("CODEX_LOCAL_REASONING_EFFORT_MAP")
+    if override is not None:
+        try:
+            decoded = json.loads(override)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(decoded, dict):
+            cleaned = {
+                key: value
+                for key, value in decoded.items()
+                if isinstance(key, str)
+                and key
+                and isinstance(value, str)
+                and value
+            }
+            return cleaned or None
+        return None
+    if getattr(selection, "provider", None) != "Pi":
+        return None
+    return pi_model_reasoning_effort_map(
+        selection.model,
+        server=selection.server,
+        models_path=models_path,
     )
 
 
@@ -2420,14 +2454,14 @@ def _start_proxy(
         raise OSError(
             f"local proxy port {listen_port} is already in use; choose another port"
         )
+    mitmdump = _required_command("mitmdump")
+    _check_upstream_ready(selection)
     if os.environ.get("CODEX_LOCAL_REAP", "1") not in {"0", "false", "False"}:
         for orphan in _reap_orphaned_proxies(protected_pids=protected_pids):
             print(
                 f"  closed orphaned {orphan['kind']} from an earlier session "
                 f"(pid {orphan['pid']})"
             )
-    mitmdump = _required_command("mitmdump")
-    _check_upstream_ready(selection)
     runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(runtime_dir, 0o700)
     confdir = runtime_dir / "mitmproxy"
@@ -2452,7 +2486,13 @@ def _start_proxy(
             "CODEX_LOCAL_PREFIX_CACHE_PATH": str(
                 _model_prefix_cache_path(runtime_dir, selection)
             ),
-            "CODEX_LOCAL_PREFIX_PREFILL": "1",
+            # A Codex generate:false frame is normally followed by the real
+            # turn within a few hundred milliseconds. Replaying the entire
+            # 200–500 KB prefix beside that turn competes for the same model and
+            # was slower in recorded sessions. Keep it as an explicit opt-in.
+            "CODEX_LOCAL_PREFIX_PREFILL": os.environ.get(
+                "CODEX_LOCAL_PREFIX_PREFILL", "0"
+            ),
             # The idle unloader and the residency keepalive pull in opposite
             # directions, so only one of them may be active.
             "CODEX_LOCAL_RESIDENCY_KEEPALIVE": (
@@ -2470,6 +2510,12 @@ def _start_proxy(
     context_window = _local_context_window(selection)
     if context_window:
         env["CODEX_LOCAL_LOCAL_CONTEXT_WINDOW"] = str(context_window)
+    reasoning_effort_map = _local_reasoning_effort_map(selection)
+    if reasoning_effort_map:
+        env["CODEX_LOCAL_REASONING_EFFORT_MAP"] = json.dumps(
+            reasoning_effort_map,
+            separators=(",", ":"),
+        )
     command = [
         mitmdump,
         "--quiet",
@@ -2784,7 +2830,8 @@ def _unload_model_via_omlx_admin(selection, *, timeout: float = 15.0) -> bool:
 
 def _supports_omlx_admin(selection) -> bool:
     return (
-        getattr(selection, "backend", "openai-responses") == "openai-responses"
+        str(getattr(selection, "provider", "")).casefold() == "omlx"
+        and getattr(selection, "backend", "openai-responses") == "openai-responses"
         and bool(getattr(selection, "api_key", None))
     )
 
@@ -3138,6 +3185,31 @@ def _codex_cli_executable(*, runtime_dir: Path, lab_mode: bool) -> str:
     if not app:
         raise FileNotFoundError("ChatGPT.app or Codex.app is not installed")
     return str(_write_codex_lab_wrapper(app=app, runtime_dir=runtime_dir))
+
+
+def _codex_exec_command(
+    *,
+    codex: str,
+    project: Path,
+    prompt: str,
+    local_slot: str,
+) -> list[str]:
+    """Build an exec command that actually selects the claimed local slot.
+
+    The desktop and TUI have a model picker. ``codex exec`` does not, so
+    leaving out ``--model`` silently runs the user's configured hosted default
+    and produces a convincing but entirely remote smoke test.
+    """
+    return [
+        codex,
+        "exec",
+        "--model",
+        local_slot,
+        "--skip-git-repo-check",
+        "-C",
+        str(project),
+        prompt,
+    ]
 
 
 def _should_start_dashboard(*, command: str, live: bool) -> bool:

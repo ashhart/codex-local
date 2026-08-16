@@ -190,8 +190,10 @@ in your build (the one you are least likely to want for hosted work) and
 relabels it, so you see something like `Local · Workstation · qwen3.6-27b` in
 the model picker.
 
-Select that slot and your turn is served locally. Select any other model and
-Codex talks to OpenAI exactly as before. You can switch between them mid-thread.
+Select that slot and ordinary inference is served locally. If the turn actually
+invokes an OpenAI-hosted built-in such as web search, that turn is handed to
+OpenAI so the tool can execute. Select any other model and Codex talks to OpenAI
+exactly as before. You can switch between them mid-thread.
 
 The slot name comes from Codex's own catalogue, so a Codex update does not
 strand you. Pin a specific one with `--local-slot`, or `routing.local_slot` in
@@ -202,10 +204,13 @@ the config.
 A local model is not a hosted model with a different URL, and most of Codex Local
 is the difference between those two things:
 
-- **Compaction stays local.** A hosted compaction returns its summary as
-  ciphertext only the hosted backend can decrypt. A local model reading it
-  sees noise where the conversation summary should be, which is
-  indistinguishable from having lost the thread.
+- **Compaction follows each task's model.** Local-task compaction stays local;
+  cloud-task compaction stays hosted. Response IDs and Codex's per-task cache key
+  keep that ownership intact across WebSocket reconnects, so concurrent local
+  and cloud tasks cannot borrow one another's compaction state.
+- **Parallel tasks stay isolated.** Each WebSocket has its own bridge state, and
+  queued hosted responses retain separate IDs and timers. Opening twenty local,
+  cloud, or mixed tasks does not collapse them into one last-used route.
 - **The tool array is kept on compaction turns**, with `tool_choice: none`
   rather than an emptied list. Emptying it rewrites the front of the prompt and
   costs the server its cache on the one turn that carries the whole
@@ -214,11 +219,23 @@ is the difference between those two things:
 - **The advertised context window is the local model's**, so Codex compacts
   when your model is actually full rather than when the hosted slot would have
   been.
+- **Reasoning controls follow the local model's profile.** A Pi-discovered model
+  exposes only the efforts its `thinkingLevelMap` supports. Stale unsupported
+  settings are clamped without increasing compute, so a Codex task cannot send
+  `xhigh` to a model that explicitly disables it. Choose `none` or `low` for the
+  fastest response, and `high` when the task benefits from deeper reasoning.
+- **Real turns do not race a duplicate prefix request.** Codex normally follows
+  its prewarm frame with the actual turn within a few hundred milliseconds, so
+  background full-prefix prefill is off by default. The model's normal prefix
+  cache remains active, and prefill can still be explicitly enabled for servers
+  where measurement shows a benefit.
 - **Loop guards.** A model repeating one identical tool call, or churning
   through near-identical variations of it, gets a note and then loses tool
   access for that turn. Thresholds were calibrated against 60 recorded sessions
   rather than picked: they fire on the 4 genuinely stuck ones and none of the
-  other 56.
+  other 56. Deferred catalog searches use a tighter limit because repeating the
+  same query cannot reveal a different result; Codex is redirected to an
+  already-loaded tool or a clear limitation instead of searching forever.
 - **Requests are validated before they cost you inference.** The malformed
   shapes local servers reject are caught by name up front, rather than found
   out after a 60–200 second round trip.
@@ -228,6 +245,16 @@ is the difference between those two things:
 - **Tool-call repair.** A mangled tool name is fixed only when it maps
   unambiguously to a tool actually registered in that same request. Invented or
   ambiguous names are left alone rather than guessed at.
+- **Every advertised Codex tool keeps its real execution path.** Client tools
+  such as functions, custom tools, namespaces and deferred tool search continue
+  through Codex normally. OpenAI-hosted built-ins such as web search are shown
+  to the local model as callable handoff signals. If the model invokes one, the
+  bridge suppresses the compatibility call and replays the complete turn over
+  Codex's already-authenticated hosted WebSocket, preserving the original
+  built-in definition. An unsupported compatibility function is never sent to
+  the Codex client. Contract gates run before and after transformation: every
+  catalog entry must be structurally valid, and every definition sent to a
+  local server must be a unique callable function.
 
 ## Privacy
 
@@ -235,6 +262,13 @@ is the difference between those two things:
   cookies, API keys, or query strings. The runtime directory is owner-only.
 - Your OpenAI credentials are stripped from a request before it goes to your
   local endpoint. Your endpoint's key is injected in memory and never printed.
+- A turn that actually invokes an OpenAI-hosted built-in, such as web search,
+  is necessarily sent to OpenAI so that tool can execute. The handoff is
+  recorded as `hosted_tool_handoff` and the final response is marked as remotely
+  served; ordinary local turns and client-executed tool turns remain local. On
+  the legacy HTTP fallback transport, a turn advertising a hosted tool is routed
+  remotely up front because an HTTP stream cannot be withdrawn after the local
+  model starts a compatibility call.
 - Codex Local sets the proxy and CA **only in the environment of the Codex process
   it launches**. No system proxy, no system keychain, no app bundle changes.
   When Codex exits, so does Codex Local.
