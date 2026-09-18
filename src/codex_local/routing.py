@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import ast
+from collections.abc import Mapping
 from dataclasses import dataclass
 import difflib
 import hashlib
@@ -1144,7 +1145,7 @@ def reconcile_codex_models_cache(
     display_name: str | None = None,
     description: str | None = None,
     context_window: int | None = None,
-    reasoning_effort_map: dict[str, str] | None = None,
+    reasoning_effort_map: Mapping[str, str | None] | None = None,
 ) -> tuple[str, int]:
     """Apply the local slot's advertised figures to Codex's persisted catalogue.
 
@@ -1205,7 +1206,7 @@ def adapt_model_catalog_for_local_tools(
     display_name: str | None = None,
     description: str | None = None,
     context_window: int | None = None,
-    reasoning_effort_map: dict[str, str] | None = None,
+    reasoning_effort_map: Mapping[str, str | None] | None = None,
 ) -> tuple[Any, int]:
     """Make a passing Codex model catalogue request ordinary native tools.
 
@@ -1313,7 +1314,7 @@ def adapt_model_catalog_for_local_tools(
 
 def adapt_local_reasoning_effort(
     payload: Any,
-    reasoning_effort_map: dict[str, str] | None,
+    reasoning_effort_map: Mapping[str, str | None] | None,
 ) -> tuple[str | None, str | None]:
     """Apply a private model's declared reasoning controls in place.
 
@@ -1322,7 +1323,9 @@ def adapt_local_reasoning_effort(
     recorded DeepSeek task sent ``xhigh`` even though its Pi profile explicitly
     disables that level. Unsupported values are clamped without escalating
     compute (``xhigh`` therefore becomes ``high`` when both ``high`` and ``max``
-    are available), then mapped to the provider-specific wire value.
+    are available), then mapped to the provider-specific wire value. A declared
+    level whose mapped value is null or empty is a profile quirk, not a usable
+    level, and is clamped away rather than written to the wire.
     """
     if not isinstance(payload, dict) or not reasoning_effort_map:
         return None, None
@@ -1335,9 +1338,13 @@ def adapt_local_reasoning_effort(
     supported = _ordered_local_reasoning_efforts(reasoning_effort_map)
     if not supported:
         return requested, requested
+    # A declared level is only usable when it carries a wire value; a null or
+    # empty mapping is a profile quirk, and writing it back would send an
+    # invalid ``effort`` upstream instead of clamping to a supported level.
+    declared = reasoning_effort_map.get(requested)
     selected = (
         requested
-        if requested in reasoning_effort_map
+        if isinstance(declared, str) and declared
         else _clamp_local_reasoning_effort(requested, supported)
     )
     effective = reasoning_effort_map.get(selected, selected)
@@ -1346,7 +1353,7 @@ def adapt_local_reasoning_effort(
 
 
 def _ordered_local_reasoning_efforts(
-    reasoning_effort_map: dict[str, str] | None,
+    reasoning_effort_map: Mapping[str, str | None] | None,
 ) -> list[str]:
     if not reasoning_effort_map:
         return []
