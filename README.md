@@ -96,6 +96,7 @@ repository's `src/` on the path, and hands off to the launcher. No venv, no
 
 ```bash
 ./launch.sh                 # pick a model and launch Codex
+./launch.sh ui              # the same thing from the menu bar
 ./launch.sh doctor          # check this machine is ready
 ./launch.sh config --init   # write a starting config file
 ./launch.sh status          # the session receipt
@@ -115,6 +116,29 @@ pip install -e .
 That puts a `codex-local` command on your PATH. Every subcommand and flag is
 identical, and `./launch.sh` passes straight through to the same entry point,
 so the two are interchangeable.
+
+## The menu-bar app
+
+If you would rather click than type, `desktop/` holds a small Electron app
+that lives in the macOS menu bar. Pop it open, pick a model, launch Codex;
+the tray glyph spins while your local model is answering and the popover
+shows warmup progress, live request stats, and the end-of-session receipt,
+including the config-unchanged check. Restart and unload sit next to it.
+
+```bash
+cd desktop
+npm install        # once; Node 18+ needed here only
+npm start          # or from the repository root: ./launch.sh ui
+npm run dist       # build Codex Local.app into desktop/dist/
+```
+
+The app is a frontend to the same engine: it runs the same launcher in
+`app` mode, reads the same runtime-directory files, and never sees an
+endpoint URL or credential. The `.app` bundles the Python backend, so it
+works from /Applications without the repository (it still needs `python3`
+and `mitmdump` on your machine). See `desktop/README.md` for the details,
+including how each screen can be rendered to a PNG for checking without
+clicking.
 
 ## Finding your models
 
@@ -287,6 +311,7 @@ codex-local doctor           # what's installed, what's missing, what to do
 codex-local config           # sources, and where the optional config file lives
 codex-local config --init    # write a starting config file
 codex-local status           # the current session receipt
+codex-local models           # the picker tree as JSON, for GUI frontends
 codex-local plan  --server NAME --model ID --project /path    # show, don't launch
 codex-local app   --server NAME --model ID --project /path    # desktop app
 codex-local cli   --server NAME --model ID --project /path    # codex CLI

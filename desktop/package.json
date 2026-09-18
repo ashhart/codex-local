@@ -1,0 +1,45 @@
+{
+  "name": "codex-local-desktop",
+  "productName": "Codex Local",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Menu-bar app for Codex Local: run Codex on your own local model.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --mac dir"
+  },
+  "devDependencies": {
+    "electron": "^44.3.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "local.codex.codex-local",
+    "productName": "Codex Local",
+    "asar": true,
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../src",
+        "to": "src",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**"
+        ]
+      }
+    ],
+    "mac": {
+      "target": [
+        {
+          "target": "dir"
+        }
+      ],
+      "category": "public.app-category.developer-tools",
+      "icon": "icons/icon.icns"
+    }
+  }
+}

@@ -143,6 +143,12 @@ def main() -> int:
     )
     status = sub.add_parser("status")
     status.add_argument("--runtime-dir", default=str(DEFAULT_RUNTIME_DIR))
+    models_command = sub.add_parser(
+        "models",
+        help="Print the model picker tree as JSON, for GUI frontends.",
+    )
+    models_command.add_argument("--models-path", default=str(DEFAULT_MODELS_PATH))
+    models_command.add_argument("--runtime-dir", default=str(DEFAULT_RUNTIME_DIR))
     attest = sub.add_parser("attest-desktop")
     attest.add_argument("--runtime-dir", default=str(DEFAULT_RUNTIME_DIR))
 
@@ -182,7 +188,10 @@ def main() -> int:
     sub.choices["app"].add_argument(
         "--no-menubar",
         action="store_true",
-        help="Do not start the optional macOS menu-bar status controller.",
+        help=(
+            "Do not start the optional macOS menu-bar status controller; the "
+            "file-based control channel stays active for another frontend."
+        ),
     )
     sub.choices["app"].add_argument(
         "--lab-mode",
@@ -250,6 +259,17 @@ def main() -> int:
         )
     if args.command == "status":
         print(json.dumps(interceptor_status(runtime_dir=args.runtime_dir), indent=2))
+        return 0
+    if args.command == "models":
+        print(
+            json.dumps(
+                _models_payload(
+                    models_path=Path(args.models_path).expanduser().resolve(),
+                    runtime_dir=Path(args.runtime_dir).expanduser().resolve(),
+                ),
+                indent=2,
+            )
+        )
         return 0
     if args.command == "attest-desktop":
         return _collect_desktop_attestation(
@@ -383,8 +403,12 @@ def main() -> int:
             verbose=getattr(args, "verbose", False),
         )
         dashboard.start()
-    if args.command == "app" and not getattr(args, "no_menubar", False):
-        menu_process = _start_menu_bar(runtime_dir)
+    if args.command == "app":
+        # The control channel is file-based, so any status controller can drive
+        # it: the Swift menu-bar item, or a GUI frontend passing --no-menubar
+        # that renders its own.
+        if not getattr(args, "no_menubar", False):
+            menu_process = _start_menu_bar(runtime_dir)
         control_loop = LocalControlLoop(selection=selection, runtime_dir=runtime_dir)
         control_loop.start()
     try:
@@ -1428,6 +1452,42 @@ def _discover_model_menu(*, models_path: Path) -> list[dict[str, Any]]:
                 }
             )
     return groups
+
+
+def _models_payload(*, models_path: Path, runtime_dir: Path) -> dict[str, Any]:
+    """Picker data for a GUI frontend, with no endpoint detail on the wire.
+
+    The discovery devices carry a ``base_url`` (and sit next to credentials in
+    their source configs), so this rebuilds each device from a whitelist: a GUI
+    needs the provider name and its models, and nothing else. The launcher, not
+    the frontend, resolves a choice into a selection.
+    """
+    groups: list[dict[str, Any]] = []
+    for group in _discover_model_menu(models_path=models_path):
+        devices = [
+            {
+                "provider": str(device.get("provider") or "Server"),
+                "models": [
+                    {
+                        "id": str(model["id"]),
+                        "name": str(model.get("name") or model["id"]),
+                    }
+                    for model in device.get("models", [])
+                    if isinstance(model, dict) and model.get("id")
+                ],
+            }
+            for device in group.get("devices", [])
+            if isinstance(device, dict)
+        ]
+        groups.append(
+            {"source": group["source"], "label": group["label"], "devices": devices}
+        )
+    saved = _load_last_selection(runtime_dir)
+    return {
+        "runtime_dir": str(runtime_dir),
+        "last_selection": saved or None,
+        "groups": groups,
+    }
 
 
 def _model_menu_label(item: dict[str, str]) -> str:

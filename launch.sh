@@ -7,6 +7,7 @@
 # a model, claims the slot, starts the proxy and opens Codex for you).
 #
 #   ./launch.sh                     interactive picker -> launch Codex
+#   ./launch.sh ui                  the menu-bar app (desktop/)
 #   ./launch.sh doctor              check this machine is ready
 #   ./launch.sh config --init       write a starting config file
 #   ./launch.sh status              the session receipt
@@ -113,7 +114,7 @@ fi
 command="${1-}"
 
 case "$command" in
-    "" | interactive | doctor | config | status | attest-desktop | plan | serve | exec | app | cli)
+    "" | interactive | doctor | config | status | attest-desktop | plan | serve | exec | app | cli | ui)
         ;;
     -h | --help)
         exec "$PYTHON" -m codex_local --help
@@ -135,6 +136,37 @@ if [[ "$command" == "doctor" ]]; then
         exit 1
     fi
     exit 0
+fi
+
+if [[ "$command" == "ui" ]]; then
+    # The menu-bar app: the same engine with an Electron frontend. Node is
+    # the one extra prerequisite, and its dependencies are offered rather
+    # than installed unasked, exactly like mitmproxy above.
+    command -v node >/dev/null 2>&1 || die "could not find node. Install Node 18+ (brew install node) to run the menu-bar app."
+    command -v npm >/dev/null 2>&1 || die "could not find npm; it normally ships with node."
+    if [[ ! -x "$REPO_ROOT/desktop/node_modules/.bin/electron" ]]; then
+        reply=n
+        if [[ "${CODEX_LOCAL_ASSUME_YES:-0}" == "1" ]]; then
+            reply=y
+        elif [[ -t 0 ]]; then
+            printf 'The menu-bar app needs its Node dependencies (one-time, about 100 MB).\n'
+            printf '  It will run: npm install --prefix desktop\n'
+            printf 'Install now? [y/N] '
+            read -r reply || reply=n
+        else
+            die "desktop dependencies are not installed.
+       Run once: npm install --prefix desktop"
+        fi
+        case "$reply" in
+            y | Y | yes | YES)
+                npm install --prefix "$REPO_ROOT/desktop" || die "'npm install' failed. Resolve it and re-run."
+                ;;
+            *)
+                die "run 'npm install --prefix desktop' inside the repository, then ./launch.sh ui"
+                ;;
+        esac
+    fi
+    exec npm start --prefix "$REPO_ROOT/desktop"
 fi
 
 exec "$PYTHON" -m codex_local "$@"

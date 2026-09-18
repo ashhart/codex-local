@@ -27,4 +27,13 @@ config.example.json
 config.json
 models.json
 
+# Desktop app: Node dependencies and build output stay local (dist/ is covered
+# above); the Electron sources and the app icon are committed. The .iconset
+# directories are intermediates from tools/make_app_icon.py.
+desktop/node_modules/
+desktop/icons/*.iconset/
+
+# Agent session artifacts (planning notes, scratch state), not project content.
+.zcode/
+
 .DS_Store
