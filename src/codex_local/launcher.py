@@ -41,6 +41,7 @@ from .routing import (
     pi_model_context_window,
     pi_model_reasoning_effort_map,
     select_lowest_visible_codex_model,
+    _validate_private_base_url,
 )
 
 
@@ -1922,6 +1923,17 @@ def _load_omlx_selection(
         raise ValueError(
             f"inference server {entry.get('name')!r} is missing base_url"
         )
+    # The custom-server path owes the same boundary as discovery: a hosted
+    # URL labelled "Local" would quietly ship the conversation off the
+    # machine, which is the one thing this tool promises never to do.
+    try:
+        _validate_private_base_url(base_url)
+    except ValueError as exc:
+        raise ValueError(
+            f"inference server {entry.get('name')!r} is not a private endpoint"
+            f" ({exc}); Codex Local only routes to loopback, private LAN,"
+            " link-local and .local hosts"
+        ) from exc
     return LocalSelection(
         provider="oMLX",
         server=str(entry["name"]),
@@ -1941,6 +1953,12 @@ def _list_omlx_model_choices(*, models_path: Path) -> list[dict[str, str]]:
             continue
         server_name = server.get("name")
         if not isinstance(server_name, str) or not server_name:
+            continue
+        # Same boundary as the other sources: a server behind a public URL is
+        # one fewer server, never an error, and never a picker entry.
+        try:
+            _validate_private_base_url(server.get("base_url"))
+        except ValueError:
             continue
         for item in server.get("models", []):
             if not isinstance(item, dict):
