@@ -72,6 +72,7 @@ from codex_local.routing import (  # noqa: E402
     adapt_model_catalog_for_local_tools,
     add_gpt_56_pro_catalog_entry,
     codex_models_cache_path,
+    json_bytes,
     local_auto_compact_limit,
     reconcile_codex_models_cache,
     adapt_client_tool_call_sse,
@@ -1905,9 +1906,7 @@ class CodexLocalInterceptor:
             transform_ms = max(0, round((time.monotonic() - started) * 1000))
             # Serialize the request once: the byte count, the upstream body the
             # worker sends, and the audit field all come from this single dump.
-            request_body = json.dumps(
-                transformed, ensure_ascii=False, separators=(",", ":")
-            ).encode("utf-8")
+            request_body = json_bytes(transformed)
             request_summary = summarize_responses_request(expanded, len(request_body))
             if not compaction_request:
                 self._schedule_prefix_prefill(
@@ -2266,9 +2265,7 @@ class CodexLocalInterceptor:
             body = (
                 request_body
                 if request_body is not None
-                else json.dumps(
-                    payload, ensure_ascii=False, separators=(",", ":")
-                ).encode("utf-8")
+                else json_bytes(payload)
             )
             for attempt in range(1, LOCAL_TRANSIENT_RETRY_ATTEMPTS + 1):
                 emitted_data = False

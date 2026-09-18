@@ -1119,6 +1119,34 @@ AUTO_COMPACT_BUFFER_TOKENS = 32_000
 CODEX_MODELS_CACHE_FILENAME = "models_cache.json"
 
 
+def json_bytes(
+    value: Any, *, sort_keys: bool = False, default: Any = None
+) -> bytes:
+    """Serialize to compact UTF-8 JSON bytes for the wire.
+
+    JSON permits lone surrogates (JavaScript's JSON.stringify escapes them,
+    and ``json.loads`` accepts them), but raw UTF-8 encoding does not. The
+    fallback re-dumps fully escaped, which every JSON parser -- including a
+    local server's -- decodes to the same value.
+    """
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=sort_keys,
+            separators=(",", ":"),
+            default=default,
+        ).encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=sort_keys,
+            separators=(",", ":"),
+            default=default,
+        ).encode("utf-8")
+
+
 def local_auto_compact_limit(context_window: int | None) -> int | None:
     """Where Codex should auto-compact a local model of this window.
 
@@ -1184,13 +1212,17 @@ def reconcile_codex_models_cache(
         return "unchanged", 0
     temporary = path.with_name(path.name + ".codex-local.tmp")
     try:
+        # ensure_ascii escapes lone surrogates, which json.loads accepts and
+        # JavaScript's JSON.stringify emits for unpaired ones: raw output would
+        # die in UTF-8 encoding on Codex's own persisted file. Escaped JSON is
+        # value-identical to what Codex wrote.
         temporary.write_text(
-            json.dumps(adapted, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(adapted, ensure_ascii=True, separators=(",", ":")),
             encoding="utf-8",
         )
         os.chmod(temporary, mode)
         temporary.replace(path)
-    except OSError:
+    except (OSError, UnicodeError):
         try:
             temporary.unlink(missing_ok=True)
         except OSError:
@@ -2903,13 +2935,7 @@ def validate_local_request(payload: Any) -> list[str]:
 def canonical_digest(value: Any) -> str:
     """A stable digest of a request, for recognising an identical retry."""
     return hashlib.sha256(
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode("utf-8")
+        json_bytes(value, sort_keys=True, default=str)
     ).hexdigest()
 
 
