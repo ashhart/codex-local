@@ -278,8 +278,8 @@ is the difference between those two things:
   through Codex normally. OpenAI-hosted built-ins such as web search are shown
   to the local model as callable handoff signals. If the model invokes one, the
   bridge suppresses the compatibility call and replays the complete turn over
-  Codex's already-authenticated hosted WebSocket, preserving the original
-  built-in definition. An unsupported compatibility function is never sent to
+  Codex's already-authenticated hosted WebSocket. The original built-in
+  definition survives unchanged. An unsupported compatibility function is never sent to
   the Codex client. Contract gates run before and after transformation: every
   catalog entry must be structurally valid, and every definition sent to a
   local server must be a unique callable function.
