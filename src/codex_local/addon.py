@@ -2463,7 +2463,7 @@ class CodexLocalInterceptor:
             "inject.websocket",
             flow,
             True,
-            json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            json_bytes(event),
         )
 
     def _handoff_websocket_turn_to_hosted(
@@ -2712,11 +2712,7 @@ class CodexLocalInterceptor:
                         else:
                             flow.response.headers["Content-Type"] = "application/json"
                             flow.response.set_content(
-                                json.dumps(
-                                    transformed,
-                                    ensure_ascii=False,
-                                    separators=(",", ":"),
-                                ).encode("utf-8")
+                                json_bytes(transformed)
                             )
                 except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                     pass
@@ -2734,11 +2730,7 @@ class CodexLocalInterceptor:
                         flow.metadata.get("codex_local_client_tool_mappings", {}),
                     )
                     flow.response.set_content(
-                        json.dumps(
-                            transformed,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
+                        json_bytes(transformed)
                     )
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     pass
