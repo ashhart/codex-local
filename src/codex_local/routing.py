@@ -95,6 +95,9 @@ SAFE_EVENT_FIELDS = frozenset(
         "previous_local_slot",
         "patched_model_count",
         "advertised_context_window",
+        "advertised_auto_compact_limit",
+        "models_cache_status",
+        "models_cache_patched_count",
         "opaque_compaction_item_count",
         "forced_local_compaction",
         "empty_model_output",
@@ -426,6 +429,16 @@ def format_interceptor_event(event: dict[str, Any]) -> str | None:
         count = event.get("patched_model_count")
         count_text = str(count) if isinstance(count, int) else "0"
         return f"[{clock}] LOCAL ✓ native tool mode enabled for {count_text} model(s)"
+    if event_name == "models_cache_reconciled":
+        status = _display_token(
+            event.get("models_cache_status"), 16, fallback="checked"
+        )
+        window = event.get("advertised_context_window")
+        if status == "reconciled" and isinstance(window, int):
+            return f"[{clock}] LOCAL ✓ Codex compaction limit corrected to {window}"
+        if status in {"unreadable", "unwritable"}:
+            return f"[{clock}] LOCAL ! Codex model cache {status}; compaction may be early"
+        return f"[{clock}] LOCAL · Codex model cache {status}"
     if event_name == "textual_tool_call_repaired":
         return f"[{clock}] LOCAL ✓ textual tool call converted to native function call"
     if event_name == "local_reasoning_item_repaired":
@@ -1098,6 +1111,92 @@ def adapt_gpt_56_pro_request(payload: Any) -> tuple[Any, bool]:
 # summarising instruction, so it needs room to run inside the same window.
 AUTO_COMPACT_BUFFER_TOKENS = 32_000
 
+# Codex persists the catalogue it fetched under its own home and reads the
+# compaction figures back from there. Patching the wire response alone is
+# therefore not enough: a client that refetches outside the proxy overwrites the
+# file with the hosted slot's window, and Codex compacts against that instead.
+CODEX_MODELS_CACHE_FILENAME = "models_cache.json"
+
+
+def local_auto_compact_limit(context_window: int | None) -> int | None:
+    """Where Codex should auto-compact a local model of this window.
+
+    The compaction turn carries the whole conversation plus its summarising
+    instruction, so it has to fit inside the same window it is compacting.
+    """
+    if not isinstance(context_window, bool) and isinstance(context_window, int):
+        if context_window > 0:
+            return max(1, context_window - AUTO_COMPACT_BUFFER_TOKENS)
+    return None
+
+
+def codex_models_cache_path() -> Path:
+    """Where Codex keeps its own copy of the model catalogue."""
+    home = os.environ.get("CODEX_HOME")
+    base = Path(home).expanduser() if home else Path.home() / ".codex"
+    return base / CODEX_MODELS_CACHE_FILENAME
+
+
+def reconcile_codex_models_cache(
+    path: Path,
+    *,
+    local_slot: str | None = None,
+    display_name: str | None = None,
+    description: str | None = None,
+    context_window: int | None = None,
+    reasoning_effort_map: dict[str, str] | None = None,
+) -> tuple[str, int]:
+    """Apply the local slot's advertised figures to Codex's persisted catalogue.
+
+    This is the one place Codex Local writes outside its own runtime directory,
+    and it exists because the wire adaptation provably was not enough. Measured
+    over one recorded evening, all 65 catalogue responses were patched to a
+    1048576-token window while every compaction still fired at roughly 113500
+    tokens, which is 88% of the hosted slot's 128000: Codex was reading the
+    window and ``auto_compact_token_limit`` back out of this file, not off the
+    wire.
+
+    Only the claimed local slot is touched, only fields Codex Local already
+    advertises are written, and every other key in the file (``fetched_at``,
+    ``etag``, ``client_version``, and every other model) is preserved verbatim.
+    A file that is absent, unreadable or already correct is left alone, so a
+    reconciled cache does not get rewritten on every catalogue fetch.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        return "absent", 0
+    try:
+        decoded = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return "unreadable", 0
+    adapted, count = adapt_model_catalog_for_local_tools(
+        decoded,
+        local_slot=local_slot,
+        display_name=display_name,
+        description=description,
+        context_window=context_window,
+        reasoning_effort_map=reasoning_effort_map,
+    )
+    if not count:
+        return "unchanged", 0
+    temporary = path.with_name(path.name + ".codex-local.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(adapted, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.chmod(temporary, mode)
+        temporary.replace(path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return "unwritable", 0
+    return "reconciled", count
+
 
 def adapt_model_catalog_for_local_tools(
     payload: Any,
@@ -1110,8 +1209,10 @@ def adapt_model_catalog_for_local_tools(
 ) -> tuple[Any, int]:
     """Make a passing Codex model catalogue request ordinary native tools.
 
-    This is deliberately a wire-response adaptation: it does not read or write
-    Codex configuration or its on-disk model cache.
+    This is a pure transform of a decoded catalogue: it reads and writes
+    nothing. It is applied to the wire response, and to the copy Codex persists
+    for itself, by ``reconcile_codex_models_cache``, which owns that file
+    access; Codex's TOML configuration is still never read or written.
     """
     if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
         return payload, 0
@@ -1163,10 +1264,11 @@ def adapt_model_catalog_for_local_tools(
                 # against a 128000-token hosted slot, compaction fired between
                 # 107k and 120k tokens while the local model had a million
                 # available. Set the limit explicitly, keeping a buffer so the
-                # summarising turn itself still fits.
-                compact_limit = max(
-                    1, context_window - AUTO_COMPACT_BUFFER_TOKENS
-                )
+                # summarising turn itself still fits. Setting it here is still
+                # not sufficient on its own: Codex reads these two fields back
+                # out of its persisted catalogue, which
+                # ``reconcile_codex_models_cache`` keeps in step.
+                compact_limit = local_auto_compact_limit(context_window)
                 if model.get("auto_compact_token_limit") != compact_limit:
                     model["auto_compact_token_limit"] = compact_limit
                     changed = True

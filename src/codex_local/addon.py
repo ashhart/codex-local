@@ -71,6 +71,9 @@ from codex_local.routing import (  # noqa: E402
     adapt_local_reasoning_effort,
     adapt_model_catalog_for_local_tools,
     add_gpt_56_pro_catalog_entry,
+    codex_models_cache_path,
+    local_auto_compact_limit,
+    reconcile_codex_models_cache,
     adapt_client_tool_call_sse,
     adapt_textual_tool_call_sse,
     adapt_compaction_response,
@@ -152,6 +155,13 @@ MODEL_RESIDENCY_INTERVAL_SECONDS = float(
 MODEL_RESIDENCY_POLL_SECONDS = min(
     30.0,
     max(1.0, MODEL_RESIDENCY_INTERVAL_SECONDS / 4),
+)
+# A Codex client that updates itself relaunches outside the proxy and rewrites
+# its catalogue from upstream. This is a stat() per tick, and only re-reads the
+# file when something other than us touched it, so it can be cheap and frequent:
+# a conversation takes far longer than this to reach a compaction limit.
+MODELS_CACHE_POLL_SECONDS = float(
+    os.environ.get("CODEX_LOCAL_MODELS_CACHE_POLL", "30")
 )
 # Applied per socket read, so keepalive comments from a slow local upstream keep
 # resetting it. Abandoning a live stream costs a full inference: the upstream
@@ -433,6 +443,22 @@ class CodexLocalInterceptor:
         self.local_context_window = _positive_int_env(
             "CODEX_LOCAL_LOCAL_CONTEXT_WINDOW"
         )
+        self.local_auto_compact_limit = local_auto_compact_limit(
+            self.local_context_window
+        )
+        # Codex reads the window and the auto-compact limit back out of its own
+        # persisted catalogue, so patching the wire response is not sufficient.
+        # `0` leaves that file alone for anyone who would rather Codex Local
+        # never wrote outside its runtime directory.
+        models_cache = os.environ.get("CODEX_LOCAL_MODELS_CACHE_PATH")
+        self.models_cache_path = (
+            None
+            if models_cache in {"0", "false", "False"}
+            else Path(models_cache).expanduser()
+            if models_cache
+            else codex_models_cache_path()
+        )
+        self._models_cache_mtime_ns: int | None = None
         self.local_reasoning_effort_map = _string_map_env(
             "CODEX_LOCAL_REASONING_EFFORT_MAP"
         )
@@ -508,6 +534,7 @@ class CodexLocalInterceptor:
             local_slot=self.local_slot,
             code_fingerprint=self.code_fingerprint,
             advertised_context_window=self.local_context_window,
+            advertised_auto_compact_limit=self.local_auto_compact_limit,
             supported_reasoning_levels=(
                 list(self.local_reasoning_effort_map)
                 if self.local_reasoning_effort_map
@@ -518,13 +545,78 @@ class CodexLocalInterceptor:
                 "monitoring" if self.residency_keepalive_enabled else "disabled"
             ),
         )
+        # A client that refetched the catalogue outside the proxy leaves the
+        # hosted slot's window on disk, and Codex compacts against it for the
+        # whole session. Correct it before the first turn rather than waiting
+        # for a catalogue fetch that a warm client may never make.
+        self._reconcile_models_cache()
+
+    def _reconcile_models_cache(self) -> None:
+        """Keep Codex's persisted catalogue in step with what we advertise."""
+        # Writing outside our own runtime directory is only ever justified by
+        # the compaction limit, so without a window to advertise, or a slot to
+        # advertise it against, Codex's file is none of our business.
+        if (
+            self.models_cache_path is None
+            or not self.local_slot
+            or not self.local_context_window
+        ):
+            return
+        try:
+            self._models_cache_mtime_ns = self.models_cache_path.stat().st_mtime_ns
+        except OSError:
+            self._models_cache_mtime_ns = None
+        status, count = reconcile_codex_models_cache(
+            self.models_cache_path,
+            local_slot=self.local_slot,
+            display_name=self.local_label,
+            description=f"Served locally by {self.local_server}: {self.model}",
+            context_window=self.local_context_window,
+            reasoning_effort_map=self.local_reasoning_effort_map,
+        )
+        if status == "reconciled":
+            try:
+                self._models_cache_mtime_ns = self.models_cache_path.stat().st_mtime_ns
+            except OSError:
+                self._models_cache_mtime_ns = None
+        if status == "unchanged":
+            return
+        self._record(
+            "models_cache_reconciled",
+            models_cache_status=status,
+            models_cache_patched_count=count,
+            advertised_context_window=self.local_context_window,
+            advertised_auto_compact_limit=self.local_auto_compact_limit,
+        )
+
+    def _models_cache_changed_underneath(self) -> bool:
+        """True when something other than us rewrote Codex's catalogue."""
+        if self.models_cache_path is None:
+            return False
+        try:
+            current = self.models_cache_path.stat().st_mtime_ns
+        except OSError:
+            return False
+        return current != self._models_cache_mtime_ns
 
     async def running(self) -> None:
-        if not self.residency_keepalive_enabled:
-            return
-        task = asyncio.create_task(self._residency_loop())
-        self.websocket_tasks.add(task)
-        task.add_done_callback(self.websocket_tasks.discard)
+        # The catalogue watch is not part of keepalive: a session with residency
+        # disabled still has Codex rewriting its cache out from under it.
+        for enabled, loop in (
+            (self.residency_keepalive_enabled, self._residency_loop),
+            (self.models_cache_path is not None, self._models_cache_loop),
+        ):
+            if not enabled:
+                continue
+            task = asyncio.create_task(loop())
+            self.websocket_tasks.add(task)
+            task.add_done_callback(self.websocket_tasks.discard)
+
+    async def _models_cache_loop(self) -> None:
+        while True:
+            await asyncio.sleep(MODELS_CACHE_POLL_SECONDS)
+            if self._models_cache_changed_underneath():
+                self._reconcile_models_cache()
 
     def done(self) -> None:
         for task in tuple(self.websocket_tasks):
@@ -2541,7 +2633,12 @@ class CodexLocalInterceptor:
                     status=flow.response.status_code,
                     patched_model_count=patched_count,
                     advertised_context_window=self.local_context_window,
+                    advertised_auto_compact_limit=self.local_auto_compact_limit,
                 )
+                # Codex is about to persist what it just fetched. Correct the
+                # copy it keeps, or it compacts against the hosted window no
+                # matter what this response said.
+                self._reconcile_models_cache()
             self._record(
                 "response_passthrough",
                 original_host=flow.metadata.get("codex_local_original_host"),

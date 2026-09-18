@@ -218,7 +218,11 @@ is the difference between those two things:
   the tools kept, and 0 without.
 - **The advertised context window is the local model's**, so Codex compacts
   when your model is actually full rather than when the hosted slot would have
-  been.
+  been. Codex reads the compaction limit from its cache under `CODEX_HOME`, so
+  Codex Local writes the figure to both the response and that cache. Patching
+  only the response left a million-token model compacting at 113500 tokens six
+  times in one evening. Codex Local changes no other cache fields.
+  `CODEX_LOCAL_MODELS_CACHE_PATH=0` disables the cache write.
 - **Reasoning controls follow the local model's profile.** A Pi-discovered model
   exposes only the efforts its `thinkingLevelMap` supports. Stale unsupported
   settings are clamped without increasing compute, so a Codex task cannot send
