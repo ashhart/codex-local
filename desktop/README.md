@@ -1,66 +1,56 @@
-# Codex Local, as a menu-bar app
+# Codex Local Electron app
 
-The same engine as the terminal flow, driven from a small popover that lives
-in the macOS menu bar: click the status item, pick a model, launch Codex.
-The tray glyph tracks each turn (spinner while the local model is working,
-filled diamond on success, red on failure), and the popover shows warmup
-progress, live request stats, and the end-of-session receipt.
+A macOS menu-bar app for choosing a local model and launching Codex.
+It uses the same Python backend as the command-line tool.
 
-The Electron app is a frontend, nothing more. It spawns the Python launcher
-(`app` mode, `--no-menubar --no-attestation`), reads the same
-`dashboard.json` / `session.json` / `warmup.json` files the terminal
-dashboard writes, and sends restart/unload through the same `control.jsonl`
-channel the Swift status item uses. It holds no endpoint URLs and no
-credentials; the model list comes from `codex-local models`, which
-whitelists provider names and model ids.
+## Run from source
 
-## Run it from a checkout
+Install Python 3.10+, mitmproxy, Node, and npm, then run these commands from
+this directory:
 
 ```bash
-npm install          # once; downloads Electron, about 100 MB
-npm start            # or from the repository root: ./launch.sh ui
+npm install
+npm start
 ```
 
-Prerequisites beyond the usual Codex Local ones: Node 18+ (for development
-only; the packaged .app needs nothing but what it bundles).
+From the repository root, `./launch.sh ui` starts the same app and offers to
+install missing dependencies.
 
-## Package a .app
+Choose a model and project, then click **Launch Codex**.
+Quit any existing Codex desktop process first.
+The app shows warmup progress, request statistics, and session errors.
+Ending a session stops the proxy and asks the Codex desktop app to quit.
+
+## Build a macOS app
 
 ```bash
 npm run dist
 ```
 
-Produces `dist/mac-arm64/Codex Local.app`. Drag it to /Applications. The
-bundle carries the Python backend under `Contents/Resources/src`, so the app
-runs without the repository; it still needs `python3` and `mitmdump` on your
-PATH, which the popover's readiness banner checks via `codex-local doctor`.
-An app launched from Finder starts with a minimal PATH, so it borrows your
-login shell's PATH first and falls back to the usual Homebrew prefixes.
+On Apple Silicon, the output is `dist/mac-arm64/Codex Local.app`.
+Copy it to `/Applications` to run it without the checkout.
+The bundle includes the Python source but still needs `python3` and
+`mitmdump` installed. It checks these prerequisites at startup.
 
-The app is signed with whatever identity electron-builder finds locally and
-is not notarized; it is built for your own machine, not for distribution.
-Quitting the app ends the session: the proxy is stopped and ChatGPT is asked
-to quit, because a ChatGPT left running without its proxy is broken.
+The build uses an available signing identity unless signing is disabled.
+It is not notarized by this build command.
+For an unsigned local build:
 
-## Verifying the UI without clicking anything
+```bash
+CSC_IDENTITY_AUTO_DISCOVERY=false npm run dist
+```
 
-Three environment hooks render each screen to a PNG and exit, for
-regression-checking the interface:
+## Capture a screen
+
+These commands render a screen to a PNG and exit:
 
 ```bash
 CODEX_LOCAL_DESKTOP_SCREENSHOT=/tmp/idle.png npm start
 
-# The real refusal path: launches the remembered selection, which fails
-# fast when ChatGPT is already running.
-CODEX_LOCAL_DESKTOP_E2E=refuse CODEX_LOCAL_DESKTOP_SCREENSHOT=/tmp/err.png npm start
-
-# Renders the running/ended screens from a JSON fixture instead.
-CODEX_LOCAL_DESKTOP_E2E=fixture CODEX_LOCAL_DESKTOP_FIXTURE=f.json \
-  CODEX_LOCAL_DESKTOP_SCREENSHOT=/tmp/run.png npm start
+CODEX_LOCAL_DESKTOP_E2E=fixture CODEX_LOCAL_DESKTOP_FIXTURE=fixture.json \
+  CODEX_LOCAL_DESKTOP_SCREENSHOT=/tmp/session.png npm start
 ```
 
-The app icon is generated from geometry (no image files in the repository):
-
-```bash
-python3 tools/make_app_icon.py desktop/icons/icon.icns
-```
+The fixture file supplies a `phase`, such as `running` or `ended`, plus optional
+`selection`, `dashboard`, `receipt`, and `warmup` objects.
+Screenshots can include model names and project paths; review them before sharing.

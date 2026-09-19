@@ -189,27 +189,28 @@ async function readJsonCached(filePath, previous) {
 
 function computePhase() {
   if (state.forcedPhase) return state.forcedPhase;
-  if (state.child) {
-    if (state.childExit) {
-      // The launcher exited; judge the session by the receipt it left behind.
-      const receiptPhase = state.receipt?.phase;
-      if (
-        receiptPhase === 'app_launch_refused_running_instance' ||
-        receiptPhase === 'proxy_start_failed'
-      ) {
-        return 'error';
-      }
-      if (state.childExit.code === 0 || state.childExit.code === 130) {
-        return 'ended';
-      }
-      if (receiptPhase === 'app_running' || receiptPhase === 'app_exited') {
-        return 'ended';
-      }
+  if (state.childExit) {
+    // Both process exit handlers clear child before publishing the snapshot.
+    // Classify the saved exit independently of the live process reference.
+    const receiptPhase = state.receipt?.phase;
+    if (
+      receiptPhase === 'app_launch_refused_running_instance' ||
+      receiptPhase === 'proxy_start_failed'
+    ) {
       return 'error';
     }
+    if (state.childExit.code === 0 || state.childExit.code === 130) {
+      return 'ended';
+    }
+    if (receiptPhase === 'app_running' || receiptPhase === 'app_exited') {
+      return 'ended';
+    }
+    return 'error';
+  }
+  if (state.child) {
     return state.receipt?.phase === 'app_running' ? 'running' : 'starting';
   }
-  return state.childExit ? 'ended' : 'idle';
+  return 'idle';
 }
 
 function errorInfo() {
