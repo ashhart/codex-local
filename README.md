@@ -1,5 +1,7 @@
 # Codex Local
 
+![Codex Local promotional artwork showing a local LLM powering ChatGPT Codex](assets/codex-local-banner.png)
+
 Run Codex with a model on your own hardware through an Electron menu-bar app
 or a command-line tool.
 
